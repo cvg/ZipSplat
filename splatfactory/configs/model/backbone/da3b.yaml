@@ -1,0 +1,10 @@
+vit_name: vitb
+embed_dim: 768
+out_layers: [5, 8, 11]
+alt_start: 4
+qknorm_start: 4
+rope_start: 4
+cat_token: true
+with_camera_enc: true
+freeze_camera_enc: true
+weights: weights/da3-base.pth

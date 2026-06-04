@@ -1,0 +1,21 @@
+# DA3-Giant training
+defaults:
+  - model: zipsplat
+  - data: composed_252
+  - train: zipsplat
+  - benchmarks: re10k_dl3dv
+  - _self_
+
+data:
+  batch_size: 384
+  image_num_range: [2, 24]
+  view_schedule: 0.5
+  num_target_views: 4
+  preprocessing:
+    resize: 252
+    edge_divisible_by: 14
+
+train:
+  seed: 1
+  num_steps: 450_000
+  lr: 3e-4

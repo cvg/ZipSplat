@@ -1,0 +1,10 @@
+vit_name: vits
+embed_dim: 384
+out_layers: [5, 7, 11]
+alt_start: 5
+qknorm_start: 5
+rope_start: 5
+cat_token: true
+with_camera_enc: true
+freeze_camera_enc: true
+weights: weights/da3-small.pth

@@ -1,0 +1,22 @@
+name: dataset_dl3dv
+dataset_dir: data/dl3dv/540x960
+
+num_target_views: 4
+use_relative_poses: true
+require_depth: true
+normalize_baseline: false
+random_reference_view: true
+
+image_num_range: [2, 24]
+aspect_ratio_range: [1.0, 1.0]
+
+preprocessing:
+  resize: 252
+  edge_divisible_by: 14
+
+view_sampler:
+  warm_up_steps: 0
+  min_distance_between_context_views: 8
+  initial_min_distance_between_context_views: 5
+  gap_multiplier: 11
+  max_distance_between_consecutive_views: 22

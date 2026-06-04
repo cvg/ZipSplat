@@ -1,0 +1,8 @@
+torch
+numpy<2
+einops
+matplotlib
+gsplat
+plyfile
+pillow
+imageio[ffmpeg]

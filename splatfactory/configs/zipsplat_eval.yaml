@@ -1,0 +1,12 @@
+# Evaluate the released ZipSplat model. Auto-downloads the DA3-Giant weights from Hugging Face,
+# so no local training checkpoint is needed:
+#   python -m splatfactory.eval.run dl3dv_benchmark --conf zipsplat_eval eval.num_views=6
+defaults:
+  - model: zipsplat
+  - _self_
+
+model:
+  weights: zipsplat  # full released model (backbone included), auto-downloaded from Hugging Face
+  skip_head_render: true
+  backbone:
+    weights: null  # skip the DA3 training-init weights; the released checkpoint provides them

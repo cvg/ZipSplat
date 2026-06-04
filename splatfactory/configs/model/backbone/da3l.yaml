@@ -1,0 +1,10 @@
+vit_name: vitl
+embed_dim: 1024
+out_layers: [11, 17, 23]
+alt_start: 8
+qknorm_start: 8
+rope_start: 8
+cat_token: true
+with_camera_enc: true
+freeze_camera_enc: true
+weights: weights/da3-large.pth

@@ -1,0 +1,9 @@
+re10k_benchmark:
+  max_samples: 10
+  eval:
+    align_poses: true
+
+dl3dv_benchmark:
+  max_samples: 10
+  eval:
+    align_poses: true

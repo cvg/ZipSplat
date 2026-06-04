@@ -1,0 +1,10 @@
+vit_name: vitg
+embed_dim: 1536
+out_layers: [19, 29, 39]
+alt_start: 13
+qknorm_start: 13
+rope_start: 13
+cat_token: true
+with_camera_enc: true
+freeze_camera_enc: true
+weights: weights/da3-giant.pth

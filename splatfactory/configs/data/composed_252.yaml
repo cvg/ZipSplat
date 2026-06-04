@@ -1,0 +1,47 @@
+name: composed
+seed: 0
+
+val_batch_size: 1
+batch_size: 384
+num_workers: 8
+prefetch_factor: 2
+
+image_num_range: [2, 24]
+aspect_ratio_range: [1.0, 1.0]
+num_target_views: 4
+random_reference_view: true
+use_relative_poses: true
+normalize_baseline: false
+near: 0.1
+far: 100.0
+max_pose_jump_ratio: 10.0
+
+childs:
+  re10k:
+    dataset_dir: data/re10k/360x640
+    dataset_name: re10k
+    weight: 0.5
+    preprocessing:
+      resize: 252
+      edge_divisible_by: 14
+    view_sampler:
+      name: bounded
+      warm_up_steps: 0
+      min_distance_between_context_views: 35
+      gap_multiplier: 45
+      max_distance_between_consecutive_views: 90
+
+  dl3dv:
+    dataset_dir: data/dl3dv/540x960
+    dataset_name: dl3dv
+    weight: 0.5
+    preprocessing:
+      resize: 252
+      edge_divisible_by: 14
+    view_sampler:
+      name: bounded
+      warm_up_steps: 0
+      min_distance_between_context_views: 8
+      initial_min_distance_between_context_views: 5
+      gap_multiplier: 11
+      max_distance_between_consecutive_views: 22

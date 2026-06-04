@@ -1,0 +1,49 @@
+seed: 0
+matmul_precision: high
+mixed_precision: bfloat16
+
+lr: 3e-4 
+clip_grad: 1.0
+optimizer: AdamW
+optimizer_options:
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+num_steps: 450_000
+warmup_steps: ${eval:'int(${train.num_steps} * 0.05)'}
+best_key: loss/total
+writer: null
+
+eval_every_epoch: 5
+log_every_iter: 100
+plot_every_iter: 10_000
+
+ddp_find_unused_parameters: false  # cam_enc frozen, no unused trainable params
+
+lr_scaling:
+  backbone: 0.1 # da3 based backbone
+  aggregator: 0.1 # vggt based backbone
+
+lr_schedule:
+  type: SequentialLR
+  on_epoch: false
+  options:
+    milestones:
+      - ${train.warmup_steps}
+    schedulers:
+      - type: LinearLR
+        options:
+          total_iters: ${train.warmup_steps}
+          start_factor: ${eval:'1/${.total_iters}'}
+          end_factor: 1.0
+      - type: CosineAnnealingLR
+        options:
+          T_max: ${eval:'${train.num_steps} - ${train.warmup_steps}'}
+          eta_min: 0.0
+
+run_benchmarks: [dl3dv_benchmark, re10k_benchmark]
+benchmark_every_epoch: 5
+
+average_metrics: [mse, psnr, ssim, lpips]
+median_metrics: []
+stdout_metrics: [loss/total, lpips, psnr, activated_pct]

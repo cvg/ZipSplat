@@ -1,0 +1,52 @@
+defaults:
+  - backbone: da3g
+  - _self_
+
+name: networks.zipsplat
+compile_loss: false
+weights: null
+
+# General
+img_size: 252
+gaussians_per_prototype: 32
+
+# Layer role assignment (0=deepest=L39, 1=middle=L29, 2=shallowest=L19)
+# clustering_layer=0: L29 post-prepare collapses to rank 1 in trained models — cluster on L39 instead.
+clustering_layer: 0
+scene_init_layer: 0
+
+# Attention (num_heads = embed_dim / 64 for head_dim=64)
+num_heads: ${eval:'${.backbone.embed_dim} // 64'}
+mlp_ratio: 4.0
+fuse_layer_scale: 0.01
+
+# Query clustering
+query_sample_ratio: [0.5, 1.0]
+query_ratio_schedule: 0.5
+query_scale_with_views: 0.5
+knn:
+  init_mode: uniform
+  chunk_size: 2048
+  n_iters: 5
+
+# Color skip (ca_concat-style, always on when with_color_skip=true)
+with_color_skip: true
+color_skip_dim: 128
+
+# Runtime
+return_attention: true
+use_checkpoint: false
+
+# Gaussian head
+gaussian_head:
+  sh_degree: 1
+  max_scale: 0.1
+  random_background: false
+  coupled_init: true
+  use_l1_loss: true
+  use_chamfer: true
+  loss_on_context: false
+  mse_weight: 1.0
+  lpips_weight: 0.05
+  chamfer_weight: 0.1
+  depth_weight: 0.01

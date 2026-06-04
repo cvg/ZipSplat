@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "splatfactory"
+version = "1.0"
+description = "General training library for gaussian splatting related projects."
+authors = [{ name = "Alexander Veicht" }]
+requires-python = ">=3.10"
+urls = { Repository = "https://github.com/cvg/ZipSplat" }
+
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+# xformers' fused SwiGLU kernel the released checkpoint was trained with (small speedup).
+xformers = ["xformers"]
+# interactive plotly/dash figure server (splatfactory.visualization.viz3d.show_figure).
+viz = ["dash"]
+dev = ["black==23.9.1", "flake8", "isort==5.12.0"]
+
+# pyproject lives inside the package dir (mirrors GeoCalib's siclib/). Discover subpackages relative
+# to it; training is run from the repo root (e.g. `python -m splatfactory.train`), so
+# `import splatfactory` resolves via the repo root on sys.path.
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.black]
+line-length = 100
+exclude = "(venv/|docs/|third_party/)"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+atomic = true
+
+[tool.flake8]
+max-line-length = 100
+docstring-convention = "google"
+ignore = ["E203", "W503", "E402"]
+exclude = [".git", "__pycache__", "venv", "docs", "third_party", "scripts"]
