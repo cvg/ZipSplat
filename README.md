@@ -8,11 +8,11 @@
     <br>
     <sub>ETH Z&uuml;rich &nbsp;&middot;&nbsp; Microsoft</sub>
   </p>
-  <p align="center">
+  <h2 align="center">
     <a href="https://arxiv.org/abs/2606.05102">Paper</a>
     |
     <a href="https://veichta.com/zipsplat">Project Page</a>
-  </p>
+  </h2>
 </p>
 
 <p align="center">
