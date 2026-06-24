@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
+
 from zipsplat import modules
 from zipsplat.backbone import DAV3Encoder
 from zipsplat.camera import Camera
@@ -235,8 +236,8 @@ class ZipSplat(nn.Module):
         prior_pose, prior_camera = (poses, cameras) if use_priors else (None, None)
         features = self._backbone_features(images, prior_camera, prior_pose)
         layer_tokens = self._prepare(features)
-        # K-means runs on the middle layer (released checkpoint convention).
-        nearest_idx = self._cluster(layer_tokens[len(layer_tokens) // 2], compression)
+        # K-means runs on the deepest (last) layer.
+        nearest_idx = self._cluster(layer_tokens[0], compression)
         scene = self._fuse(layer_tokens, nearest_idx)
         color_feats = self._color(images, nearest_idx)
         return self.gaussian_head(torch.cat([scene, color_feats], dim=-1))
