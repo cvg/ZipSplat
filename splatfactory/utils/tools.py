@@ -458,10 +458,11 @@ def pack_lr_parameters(params, base_lr, lr_scaling):
     else:
         filters, scales = [], []
     scale2params = collections.defaultdict(list)
+    filter_patterns = [re.compile(r'(?:^|[._])' + re.escape(f) + r'(?=[._]|$)') for f in filters]
+    
     for n, p in params:
         scale = 1
-        # TODO: use proper regexp rather than just this inclusion check
-        is_match = [f in n for f in filters]
+        is_match = [bool(pat.search(n)) for pat in filter_patterns]
         if any(is_match):
             scale = scales[is_match.index(True)]
         scale2params[scale].append((n, p))
