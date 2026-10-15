@@ -70,7 +70,7 @@ class ZipSplat(nn.Module):
 
     Args:
         weights: Registry name ("zipsplat" or "zipsplat-252"), local path or http(s) URL of a
-            release checkpoint (see splatfactory/scripts/export_release.py).
+            checkpoint: a release file or the checkpoint_best.tar of a training run.
         amp: Autocast dtype of the feed-forward pass on CUDA, None for full fp32. The Gaussian
             and camera heads always decode in fp32. TokenBA keeps its own precision.
     """
