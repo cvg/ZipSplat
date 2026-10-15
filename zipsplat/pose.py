@@ -5,10 +5,54 @@ OpenCV convention: x-right, y-down, z-forward. `t` is the camera origin in world
 Author: Alexander Veicht
 """
 
+import math
 from typing import Tuple, Union
 
 import torch
+
 from zipsplat.utils import TensorWrapper
+
+
+def skew_symmetric(v: torch.Tensor) -> torch.Tensor:
+    """(..., 3) vectors -> (..., 3, 3) cross-product matrices."""
+    z = torch.zeros_like(v[..., 0])
+    M = torch.stack(
+        [z, -v[..., 2], v[..., 1], v[..., 2], z, -v[..., 0], -v[..., 1], v[..., 0], z], dim=-1
+    )
+    return M.reshape(*v.shape[:-1], 3, 3)
+
+
+def so3exp_map(w: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Axis-angle vectors (..., 3) -> rotation matrices (..., 3, 3) (Rodrigues)."""
+    theta = w.norm(p=2, dim=-1, keepdim=True)
+    small = theta < eps
+    div = torch.where(small, torch.ones_like(theta), theta)
+    W = skew_symmetric(w / div)
+    theta = theta[..., None]
+    res = W * torch.sin(theta) + (W @ W) * (1 - torch.cos(theta))
+    res = torch.where(small[..., None], W, res)  # first-order Taylor approx
+    return torch.eye(3).to(W) + res
+
+
+def quaternion_to_matrix(quaternions: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """xyzw quaternions (..., 4) -> rotation matrices (..., 3, 3)."""
+    i, j, k, r = torch.unbind(quaternions, dim=-1)
+    two_s = 2 / ((quaternions * quaternions).sum(dim=-1) + eps)
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
+    )
+    return o.reshape(*quaternions.shape[:-1], 3, 3)
 
 
 class Pose(TensorWrapper):
@@ -28,6 +72,11 @@ class Pose(TensorWrapper):
         assert t.shape[-1] == 3
         assert R.shape[:-2] == t.shape[:-1]
         return cls(torch.cat([R.flatten(start_dim=-2), t], -1))
+
+    @classmethod
+    def from_aa(cls, aa: torch.Tensor, t: torch.Tensor) -> "Pose":
+        """Build from an axis-angle rotation (..., 3) and translation (..., 3)."""
+        return cls.from_Rt(so3exp_map(aa), t)
 
     @classmethod
     def from_4x4mat(cls, T: torch.Tensor) -> "Pose":
@@ -60,7 +109,7 @@ class Pose(TensorWrapper):
 
     @staticmethod
     def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
-        """3x3 rotation matrix → wxyz quaternion. Shape (..., 3, 3) → (..., 4)."""
+        """3x3 rotation matrix -> wxyz quaternion. Shape (..., 3, 3) -> (..., 4)."""
         if matrix.size(-1) != 3 or matrix.size(-2) != 3:
             raise ValueError(f"Invalid rotation matrix shape {matrix.shape}.")
         batch_dim = matrix.shape[:-2]
@@ -118,6 +167,12 @@ class Pose(TensorWrapper):
         R = self.R @ other.R
         t = self.t + (self.R @ other.t.unsqueeze(-1)).squeeze(-1)
         return self.__class__.from_Rt(R, t)
+
+    def magnitude(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rotation angle in degrees and translation norm."""
+        trace = torch.diagonal(self.R, dim1=-1, dim2=-2).sum(-1)
+        cos = torch.clamp((trace - 1) / 2, -1, 1)
+        return torch.acos(cos).abs() / math.pi * 180, torch.norm(self.t, dim=-1)
 
     def transform(self, p3d: torch.Tensor) -> torch.Tensor:
         """Transform 3D points (..., N, 3)."""

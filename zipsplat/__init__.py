@@ -1,4 +1,4 @@
-"""ZipSplat — feed-forward 3DGS from multi-view images.
+"""ZipSplat -- feed-forward 3DGS from unposed multi-view images, with test-time BA.
 
 Author: Alexander Veicht
 """
@@ -9,9 +9,10 @@ from zipsplat.camera import Camera
 from zipsplat.gaussians import Gaussians
 from zipsplat.pose import Pose
 from zipsplat.predictor import ZipSplat
+from zipsplat.token_ba import TokenBA
 from zipsplat.utils import load_image, load_video
 
-__all__ = ["ZipSplat", "Camera", "Pose", "Gaussians", "load_image", "load_video"]
+__all__ = ["ZipSplat", "TokenBA", "Camera", "Pose", "Gaussians", "load_image", "load_video"]
 
 formatter = logging.Formatter(
     fmt="[%(asctime)s %(name)s %(levelname)s] %(message)s",

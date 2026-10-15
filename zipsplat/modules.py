@@ -1,14 +1,14 @@
-"""Transformer building blocks: PatchEmbed, RoPE2D, attention, FFNs, transformer blocks.
+"""Building blocks: PatchEmbed, RoPE2D, attention, FFNs, transformer blocks and ZipSplat's
+color embedding and token merge.
 
-Most blocks adapted from DINOv2 / timm (© Meta Platforms, Apache-2.0). Trimmed for
+Most blocks adapted from DINOv2 / timm ((c) Meta Platforms, Apache-2.0). Trimmed for
 inference.
 
 Author: Alexander Veicht
 """
 
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,7 +48,7 @@ class LayerScale(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """2D image → flat patch tokens: (B, C, H, W) → (B, N, D)."""
+    """2D image -> flat patch tokens: (B, C, H, W) -> (B, N, D)."""
 
     def __init__(
         self,
@@ -269,6 +269,12 @@ class SelfAttention(nn.Module):
 
 
 class CrossAttention(nn.Module):
+    """Multi-head cross-attention with separate query / key / value sources.
+
+    `key` and `value` must be token-aligned: ZipSplat attends with the geometry tokens as keys
+    and reads a different payload (a backbone layer or the color tokens) as values.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -283,21 +289,19 @@ class CrossAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.k_proj = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(dim, dim, bias=qkv_bias)
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.proj = nn.Linear(dim, dim, bias=proj_bias)
 
-    def forward(self, queries: Tensor, context: Tensor) -> Tensor:
-        B, N_q, C = queries.shape
-        N_c = context.shape[1]
-        q = self.q_proj(queries).reshape(B, N_q, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        kv = (
-            self.kv_proj(context)
-            .reshape(B, N_c, 2, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
-        )
-        k, v = kv.unbind(0)
+    def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        B, N_q, C = query.shape
+        N_c = key.shape[1]
+        heads = lambda x, n: x.reshape(B, n, self.num_heads, self.head_dim).transpose(1, 2)  # noqa
+        q = heads(self.q_proj(query), N_q)
+        k = heads(self.k_proj(key), N_c)
+        v = heads(self.v_proj(value), N_c)
         q, k = self.q_norm(q), self.k_norm(k)
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N_q, C)
@@ -320,11 +324,11 @@ class SelfAttentionBlock(nn.Module):
         qkv_bias: bool = True,
         proj_bias: bool = True,
         ffn_bias: bool = True,
-        init_values: Optional[float] = None,
+        init_values: Optional[float] = 0.01,
         act_layer: Callable[..., nn.Module] = nn.GELU,
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
         ffn_layer: Callable[..., nn.Module] = Mlp,
-        qk_norm: bool = False,
+        qk_norm: bool = True,
         rope: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
@@ -354,15 +358,8 @@ class SelfAttentionBlock(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    """Pre-LN cross-attention block.
-
-    Default: returns queries + attn_delta + mlp_delta (standard transformer output).
-    `return_delta=True`: returns ONLY attn_delta + mlp_delta. The MLP still operates on
-    (queries + attn_delta) so its non-linearity sees a valid post-attention state, but
-    only the sum of the two deltas is returned. Used by ZipSplat to inject a CA layer's
-    contribution into a separate scene_tokens stream while using `queries` as the
-    attention query source (not as the residual anchor).
-    """
+    """Pre-LN cross-attention block with its own norm per source:
+    q -> q + ls1(attn(norm_q(q), norm_k(k), norm_v(v))) -> . + ls2(mlp(norm2(.)))."""
 
     def __init__(
         self,
@@ -372,14 +369,15 @@ class CrossAttentionBlock(nn.Module):
         qkv_bias: bool = True,
         proj_bias: bool = True,
         ffn_bias: bool = True,
-        init_values: Optional[float] = None,
+        init_values: Optional[float] = 0.01,
         act_layer: Callable[..., nn.Module] = nn.GELU,
         norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
-        qk_norm: bool = False,
+        qk_norm: bool = True,
     ) -> None:
         super().__init__()
         self.norm_q = norm_layer(dim)
-        self.norm_kv = norm_layer(dim)
+        self.norm_k = norm_layer(dim)
+        self.norm_v = norm_layer(dim)
         self.attn = CrossAttention(
             dim,
             num_heads=num_heads,
@@ -397,16 +395,49 @@ class CrossAttentionBlock(nn.Module):
         )
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
 
-    def forward(
-        self,
-        queries: Tensor,
-        context: Tensor,
-        return_delta: bool = False,
-    ) -> Tensor:
-        attn_out = self.attn(self.norm_q(queries), self.norm_kv(context))
-        attn_delta = self.ls1(attn_out)
-        post_attn = queries + attn_delta
-        mlp_delta = self.ls2(self.mlp(self.norm2(post_attn)))
-        if return_delta:
-            return attn_delta + mlp_delta
-        return post_attn + mlp_delta
+    def forward(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+        x = query + self.ls1(self.attn(self.norm_q(query), self.norm_k(key), self.norm_v(value)))
+        return x + self.ls2(self.mlp(self.norm2(x)))
+
+
+# ---------------------------------------------------------------------------
+# ZipSplat token streams
+# ---------------------------------------------------------------------------
+
+
+class ColorEmbedMLP(nn.Module):
+    """Per-patch MLP from raw RGB patches to embed_dim color tokens.
+
+    The Conv2d with kernel = stride = patch is a per-patch Linear on the flattened pixels,
+    followed by GELU and Linear.
+    """
+
+    def __init__(self, patch_size: int, in_chans: int, embed_dim: int) -> None:
+        super().__init__()
+        self.proj1 = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.act = nn.GELU()
+        self.proj2 = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """(N, 3, H, W) -> (N, T, embed_dim)."""
+        x = self.proj1(x).flatten(2).transpose(1, 2)
+        return self.proj2(self.act(x))
+
+
+class TokenMerge(nn.Module):
+    """Merge N token streams into one: sum_i LS_i(MLP_i(LN_i(t_i)))."""
+
+    def __init__(self, dim: int, num_streams: int) -> None:
+        super().__init__()
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_streams)])
+        self.projs = nn.ModuleList([Mlp(dim, hidden_features=dim) for _ in range(num_streams)])
+        self.gates = nn.ModuleList(
+            [LayerScale(dim, init_values=1 / num_streams) for _ in range(num_streams)]
+        )
+
+    def forward(self, tokens: List[Tensor]) -> Tensor:
+        """List of N (..., dim) tensors -> (..., dim)."""
+        out = 0
+        for norm, proj, gate, t in zip(self.norms, self.projs, self.gates, tokens):
+            out = out + gate(proj(norm(t)))
+        return out

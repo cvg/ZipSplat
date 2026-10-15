@@ -1,9 +1,9 @@
 """Depth-Anything-V3 ViT backbone with multi-view alternating local/global attention.
 
 Vendored and trimmed from:
-  - DINOv2 ViT (© Meta Platforms, Apache-2.0)
+  - DINOv2 ViT ((c) Meta Platforms, Apache-2.0)
   - DA3 multi-view extensions and camera-prior encoder
-    (© 2025 ByteDance Ltd., Apache-2.0; Lin et al. "Depth Anything 3", 2025)
+    ((c) 2025 ByteDance Ltd., Apache-2.0; Lin et al. "Depth Anything 3", 2025)
 
 Includes the optional camera-prior encoder (`CameraEnc`) that injects pose + intrinsics as a token
 at the `alt_start` layer, replacing the model's learned camera token.
@@ -19,8 +19,10 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
+
 from zipsplat import modules
 from zipsplat.camera import Camera
+from zipsplat.heads import CameraDec
 from zipsplat.pose import Pose
 
 # ---------------------------------------------------------------------------
@@ -31,8 +33,8 @@ from zipsplat.pose import Pose
 class CameraEnc(nn.Module):
     """Encodes (Pose, Camera) into per-view tokens injected at the ViT's `alt_start` layer.
 
-    Pose encoding is derived from world-to-cam (DA3 training convention):
-    [t_w2c (3), quat_xyzw_w2c (4), vfov, hfov].
+    Pose encoding of the cam-to-world pose (DA3's own convention):
+    [t_c2w (3), quat_xyzw_c2w (4), vfov, hfov], the FOVs at the input image size.
     """
 
     def __init__(
@@ -48,7 +50,11 @@ class CameraEnc(nn.Module):
         self.trunk = nn.Sequential(
             *[
                 modules.SelfAttentionBlock(
-                    dim=dim_out, num_heads=num_heads, mlp_ratio=mlp_ratio, init_values=init_values
+                    dim=dim_out,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    init_values=init_values,
+                    qk_norm=False,
                 )
                 for _ in range(trunk_depth)
             ]
@@ -59,11 +65,12 @@ class CameraEnc(nn.Module):
             in_features=dim_in, hidden_features=dim_out // 2, out_features=dim_out
         )
 
-    def forward(self, pose: Pose, camera: Camera) -> Tensor:
-        w2c = pose.inv()
-        quat_xyzw = w2c.quat[..., [1, 2, 3, 0]]
-        fov = torch.stack([camera.vfov, camera.hfov], dim=-1)
-        encoding = torch.cat([w2c.t, quat_xyzw, fov], dim=-1).float()
+    def forward(self, pose: Pose, camera: Camera, image_hw: Tuple[int, int]) -> Tensor:
+        H, W = image_hw
+        quat_xyzw = pose.quat[..., [1, 2, 3, 0]]
+        fy, fx = camera.K[..., 1, 1], camera.K[..., 0, 0]
+        fov = torch.stack([2 * torch.atan((H / 2) / fy), 2 * torch.atan((W / 2) / fx)], dim=-1)
+        encoding = torch.cat([pose.t, quat_xyzw, fov], dim=-1).float()
         return self.trunk_norm(self.trunk(self.token_norm(self.pose_branch(encoding))))
 
 
@@ -310,60 +317,29 @@ class DAV3DinoVisionTransformer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def vit_small(out_layers: Sequence[int] = (5, 7, 9, 11), **kwargs) -> DAV3DinoVisionTransformer:
-    return DAV3DinoVisionTransformer(
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        out_layers=out_layers,
-        alt_start=4,
-        qknorm_start=4,
-        rope_start=4,
-        ffn_layer="mlp",
-        **kwargs,
-    )
+def _factory(embed_dim: int, depth: int, num_heads: int, alt_start: int, ffn_layer: str):
+    """A DA3 variant: its size, plus the layer where the multi-view blocks (alternating
+    attention, qk-norm, RoPE) start. Keyword arguments override the variant's defaults."""
+
+    def build(out_layers: Sequence[int], **kwargs) -> DAV3DinoVisionTransformer:
+        variant = {
+            "embed_dim": embed_dim,
+            "depth": depth,
+            "num_heads": num_heads,
+            "alt_start": alt_start,
+            "qknorm_start": alt_start,
+            "rope_start": alt_start,
+            "ffn_layer": ffn_layer,
+        }
+        return DAV3DinoVisionTransformer(out_layers=out_layers, **{**variant, **kwargs})
+
+    return build
 
 
-def vit_base(out_layers: Sequence[int] = (5, 7, 9, 11), **kwargs) -> DAV3DinoVisionTransformer:
-    return DAV3DinoVisionTransformer(
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        out_layers=out_layers,
-        alt_start=4,
-        qknorm_start=4,
-        rope_start=4,
-        ffn_layer="mlp",
-        **kwargs,
-    )
-
-
-def vit_large(out_layers: Sequence[int] = (11, 15, 19, 23), **kwargs) -> DAV3DinoVisionTransformer:
-    return DAV3DinoVisionTransformer(
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        out_layers=out_layers,
-        alt_start=8,
-        qknorm_start=8,
-        rope_start=8,
-        ffn_layer="mlp",
-        **kwargs,
-    )
-
-
-def vit_giant2(out_layers: Sequence[int] = (19, 27, 33, 39), **kwargs) -> DAV3DinoVisionTransformer:
-    return DAV3DinoVisionTransformer(
-        embed_dim=1536,
-        depth=40,
-        num_heads=24,
-        out_layers=out_layers,
-        alt_start=13,
-        qknorm_start=13,
-        rope_start=13,
-        ffn_layer="swiglufused",
-        **kwargs,
-    )
+vit_small = _factory(384, 12, 6, 4, "mlp")
+vit_base = _factory(768, 12, 12, 4, "mlp")
+vit_large = _factory(1024, 24, 16, 8, "mlp")
+vit_giant2 = _factory(1536, 40, 24, 13, "swiglufused")
 
 
 _VARIANT_FACTORIES = {
@@ -380,11 +356,12 @@ _VARIANT_FACTORIES = {
 
 
 class DAV3Encoder(nn.Module):
-    """DA3 backbone with an optional camera-prior token encoder.
+    """DA3 backbone with its camera decoder and an optional camera-prior token encoder.
 
     When `pose` and `intrinsics` are passed to forward and `with_camera_enc=True`, the
     `CameraEnc` encodes them into per-view tokens that override the model's learned
-    camera token at `alt_start`.
+    camera token at `alt_start`. `cam_dec` reads the pose encoding off the deepest camera
+    token (local | global halves).
     """
 
     def __init__(
@@ -401,6 +378,7 @@ class DAV3Encoder(nn.Module):
             )
         self.backbone = _VARIANT_FACTORIES[vit_name](out_layers=out_layers, **vit_kwargs)
         self.embed_dim = self.backbone.embed_dim
+        self.cam_dec = CameraDec(dim_in=2 * self.embed_dim)
         self.cam_enc = CameraEnc(dim_out=self.embed_dim) if with_camera_enc else None
 
     def forward(
@@ -409,14 +387,14 @@ class DAV3Encoder(nn.Module):
         """Run the backbone, optionally injecting camera priors.
 
         Args:
-            image: (B, S, 3, H, W) float input in [0, 1].
+            image: (B, S, 3, H, W) ImageNet-normalized input.
             pose: cam-to-world Pose with batch shape (B, S) for prior injection. Optional.
             camera: Camera with matching batch shape for prior injection. Optional.
 
         Returns:
-            Tuple of (output, camera_token) per output layer.
+            Tuple of (output, camera_token) per output layer, shallow to deep.
         """
         cam_token = None
         if pose is not None and camera is not None and self.cam_enc is not None:
-            cam_token = self.cam_enc(pose, camera)
+            cam_token = self.cam_enc(pose, camera, image.shape[-2:])
         return self.backbone(image, cam_token=cam_token)

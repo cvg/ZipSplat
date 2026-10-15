@@ -6,6 +6,7 @@ Author: Alexander Veicht
 from typing import Optional, Tuple, Union
 
 import torch
+
 from zipsplat.utils import TensorWrapper
 
 

@@ -1,243 +1,173 @@
-"""ZipSplat model: feed-forward 3DGS from multi-view images.
+"""ZipSplat model: feed-forward 3D Gaussians, camera poses and intrinsics from unposed views.
 
-Pipeline: backbone features → optional k-means clustering → cross/self-attention
-over scene-tokens → color skip → Gaussian head.
+Pipeline (the training model, splatfactory/models/networks/zipsplat.py, without the losses):
+    1. A DA3 backbone with cross-view attention encodes the views into per-layer tokens
+       (local | global halves) plus a camera token per view.
+    2. Prepare: each layer's payload is the global half plus a gated LayerNorm of the local
+       half; a ColorEmbedMLP turns the RGB patches into color tokens; a TokenMerge over all
+       payloads and the color tokens gives one geometry token per patch.
+    3. Compress: k-means on the geometry tokens picks K = r * V * T clusters (skipped at
+       r = 1); the scene tokens start as the per-cluster member means.
+    4. Fuse: per layer, deepest first, a cross-attention (q = scene tokens, k = geometry tokens,
+       v = that layer's payload) and a self-attention; a 4th cross-attention reads the color
+       tokens.
+    5. Decode: the GaussianHead turns each scene token into a group of Gaussians with free 3D
+       offsets; the camera head reads pose and intrinsics off the deepest camera token.
 
 Author: Alexander Veicht
 """
 
-import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor
 
 from zipsplat import modules
 from zipsplat.backbone import DAV3Encoder
 from zipsplat.camera import Camera
-from zipsplat.gaussians import Gaussians
+from zipsplat.clustering import cluster_mean, complexity_kmeans
+from zipsplat.heads import GaussianHead, decode_pose_encoding
 from zipsplat.pose import Pose
-from zipsplat.utils import kmeans
 
-logger = logging.getLogger(__name__)
-
-
-def _inverse_log_transform(y: Tensor) -> Tensor:
-    """sign(y) * (exp(|y|) - 1) — expand 'log-space' position predictions."""
-    return torch.sign(y) * torch.expm1(torch.abs(y))
-
-
-class _GaussianHead(nn.Module):
-    """Mlp + Linear stack producing packed Gaussian parameters and decoding to a Gaussians scene.
-
-    The inner `self.gaussian_head` Sequential matches the splatfactory checkpoint structure
-    (`gaussian_head.gaussian_head.{0,1}.*`).
-    """
-
-    def __init__(self, head_dim: int, gaussians_per_token: int, sh_degree: int) -> None:
-        super().__init__()
-        self.gaussians_per_token = gaussians_per_token
-        self.num_sh_coeffs = (sh_degree + 1) ** 2
-        self.params_per_gaussian = 3 + 3 + 4 + 1 + self.num_sh_coeffs * 3
-        self.gaussian_head = nn.Sequential(
-            modules.Mlp(in_features=head_dim, hidden_features=2 * head_dim, out_features=head_dim),
-            nn.Linear(head_dim, gaussians_per_token * self.params_per_gaussian),
-        )
-
-    def forward(self, tokens: Tensor) -> Gaussians:
-        """Project tokens to packed Gaussian params, activate, return a Gaussians scene."""
-        params = self.gaussian_head(tokens)  # (B, N, G * params_per_g)
-        params = rearrange(
-            params,
-            "B N (G C) -> B (N G) C",
-            G=self.gaussians_per_token,
-            C=self.params_per_gaussian,
-        )
-        means = _inverse_log_transform(params[..., 0:3].clamp(-5.0, 5.0))
-        scales = F.softplus(params[..., 3:6] - 4.0).clamp(1e-6, 15.0)
-        quats = F.normalize(params[..., 6:10], dim=-1)
-        opacities = params[..., 10].sigmoid()
-        sh_coeffs = rearrange(params[..., 11:], "B N (K C) -> B N K C", K=self.num_sh_coeffs, C=3)
-        return Gaussians.from_parameters(
-            means=means, scales=scales, quats=quats, opacities=opacities, sh_coeffs=sh_coeffs
-        )
+# DA3 pretraining normalizes the backbone input with the ImageNet statistics.
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class ZipSplat(nn.Module):
-    """Feed-forward 3DGS model: images → Gaussians (DA3-Giant variant)."""
+    """Feed-forward 3DGS model: images -> Gaussians, poses and intrinsics."""
 
-    # Defaults match the released DA3-Giant checkpoint.
-    default_conf = {
-        # backbone
-        "vit_name": "vitg",
-        "patch_size": 14,
-        "out_layers": (19, 29, 39),
-        # gaussian head
-        "gaussians_per_token": 32,
-        "sh_degree": 1,
-        # color skip
-        "color_skip_dim": 128,
-        "color_mlp_ratio": 1.0,
-    }
-
-    def __init__(self, **conf) -> None:
+    def __init__(self, gaussians_per_token: int = 32) -> None:
         super().__init__()
-        self.conf = {**self.default_conf, **conf}
+        mean, std = torch.tensor(IMAGENET_MEAN), torch.tensor(IMAGENET_STD)
+        self.register_buffer("_img_mean", mean.view(1, 1, 3, 1, 1), persistent=False)
+        self.register_buffer("_img_std", std.view(1, 1, 3, 1, 1), persistent=False)
 
-        self.backbone = DAV3Encoder(
-            vit_name=self.conf["vit_name"],
-            out_layers=self.conf["out_layers"],
-            with_camera_enc=True,
-            patch_size=self.conf["patch_size"],
-        )
-        D = self.backbone.embed_dim
-        L = len(self.conf["out_layers"])
+        self.backbone = DAV3Encoder()  # DA3-Giant, read out at layers 19, 29 and 39
+        D = self.embed_dim = self.backbone.embed_dim
+        L = self.num_layers = len(self.backbone.backbone.out_layers)
+        self.patch_size = self.backbone.backbone.patch_size
 
-        # Per-layer prep: LN(local) + LN(global) + Linear(2D→D) + skip residual
-        self.pre_norm_local = nn.ModuleList([nn.LayerNorm(D) for _ in range(L)])
-        self.pre_norm_global = nn.ModuleList([nn.LayerNorm(D) for _ in range(L)])
-        self.downscale = nn.ModuleList([nn.Linear(2 * D, D) for _ in range(L)])
+        # Prepare: local-half gates, color embedding, geometry merge.
+        self.local_norm = nn.ModuleList([nn.LayerNorm(D) for _ in range(L)])
+        self.local_gate = nn.ModuleList([modules.LayerScale(D) for _ in range(L)])
+        self.color_embed_mlp = modules.ColorEmbedMLP(self.patch_size, 3, D)
+        self.geo_merge = modules.TokenMerge(D, L + 1)
 
-        # Geometry CA + SA stack (delta mode: CA returns gated delta only)
-        self.cross_attention = nn.ModuleList(
-            [
-                modules.CrossAttentionBlock(
-                    dim=D, num_heads=D // 64, mlp_ratio=4.0, qk_norm=True, init_values=0.01
-                )
-                for _ in range(L)
-            ]
-        )
-        self.self_attention = nn.ModuleList(
-            [
-                modules.SelfAttentionBlock(
-                    dim=D, num_heads=D // 64, mlp_ratio=4.0, qk_norm=True, init_values=0.01
-                )
-                for _ in range(L)
-            ]
-        )
+        # Fuse: per-layer cross- and self-attention, plus the color cross-attention.
+        H = D // 64
+        self.cross_attention = nn.ModuleList([modules.CrossAttentionBlock(D, H) for _ in range(L)])
+        self.self_attention = nn.ModuleList([modules.SelfAttentionBlock(D, H) for _ in range(L)])
+        self.color_ca = modules.CrossAttentionBlock(D, H)
 
-        # Color skip: PatchEmbed → CA in color_skip_dim (4th symmetric layer)
-        self.color_embed = modules.PatchEmbed(
-            img_size=252,
-            patch_size=self.conf["patch_size"],
-            in_chans=3,
-            embed_dim=self.conf["color_skip_dim"],
-        )
-        self.color_cross_attention = modules.CrossAttentionBlock(
-            dim=self.conf["color_skip_dim"],
-            num_heads=max(1, self.conf["color_skip_dim"] // 64),
-            mlp_ratio=self.conf["color_mlp_ratio"],
-            qk_norm=True,
-            init_values=0.01,
-        )
+        # Decode (the camera decoder is part of the DA3 backbone).
+        self.gaussian_head = GaussianHead(D, gaussians_per_token)
 
-        # Gaussian head: tokens → packed params → activate → Gaussians
-        self.gaussian_head = _GaussianHead(
-            head_dim=D + self.conf["color_skip_dim"],
-            gaussians_per_token=self.conf["gaussians_per_token"],
-            sh_degree=self.conf["sh_degree"],
-        )
+    # ------------------------- stages -------------------------
 
-    def flexible_load(self, state_dict: Dict[str, Any]) -> None:
-        """Load a state dict tolerantly: strip DDP `module.` prefix, non-strict, warn on diffs."""
-        if any(k.startswith("module.") for k in state_dict):
-            state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        unexpected = [
-            k for k in unexpected if "running" not in k and "num_batches_tracked" not in k
-        ]
-        if missing:
-            logger.warning("missing %d keys (e.g. %s)", len(missing), list(missing)[:3])
-        if unexpected:
-            logger.warning("unexpected %d keys (e.g. %s)", len(unexpected), list(unexpected)[:3])
+    def encode(
+        self, images: Tensor, cameras: Optional[Camera] = None, poses: Optional[Pose] = None
+    ) -> Dict[str, Tensor]:
+        """Backbone + prepare: everything that does not depend on the compression.
 
-    # ------------------------- per-stage helpers -------------------------
+        Args:
+            images: (B, V, 3, H, W) in [0, 1].
+            cameras, poses: Optional (B, V) priors injected into the backbone (c2w poses).
 
-    def _backbone_features(
-        self, images: Tensor, cameras: Optional[Camera], poses: Optional[Pose]
-    ) -> List[Tensor]:
-        """Run backbone, reverse so features[0] = deepest layer, drop camera token."""
-        feats = self.backbone(images, pose=poses, camera=cameras)
-        return [t[0] for t in feats[::-1]]
-
-    def _prepare(self, features: List[Tensor]) -> List[Tensor]:
-        """Per-layer pre_norm + downscale + fuse_skip (always on)."""
-        D = self.backbone.embed_dim
-        out = []
-        for l, raw in enumerate(features):  # raw: (B, V, T, 2D)
-            local = self.pre_norm_local[l](raw[..., :D])
-            global_ = self.pre_norm_global[l](raw[..., D:])
-            tok = self.downscale[l](torch.cat([local, global_], dim=-1)) + (local + global_) / 2
-            out.append(tok)
-        return out
-
-    def _cluster(self, tokens: Tensor, compression: float) -> Tensor:
-        """K-means on the deepest layer; returns nearest-token indices [B, K].
-
-        At compression=1.0 returns torch.arange(V*T) — k-means is skipped.
+        Returns:
+            Dict with layer_tokens (list of (B, V, T, D), shallow to deep), geo_tokens and
+            color_tokens (B, V, T, D), and cam_token (B, V, 2 * D) of the deepest layer.
         """
-        B, V, T, _ = tokens.shape
-        VT = V * T
-        K = max(1, int(VT * compression))
-        if K >= VT:
-            return torch.arange(VT, device=tokens.device).unsqueeze(0).expand(B, -1)
-        flat = rearrange(tokens, "B V T D -> B (V T) D")
-        with torch.no_grad(), torch.autocast(tokens.device.type, dtype=torch.bfloat16):
-            _, nearest_idx, _ = kmeans(flat, K)
-        return nearest_idx
+        x = (images - self._img_mean) / self._img_std
+        tokens = self.backbone(x, pose=poses, camera=cameras)  # (patch, camera) per layer
+        D = self.embed_dim
+        layer_tokens = [
+            raw[..., D:] + self.local_gate[l](self.local_norm[l](raw[..., :D]))
+            for l, (raw, _) in enumerate(tokens)
+        ]
+        col = self.color_embed_mlp(rearrange(images, "B V C H W -> (B V) C H W"))
+        col = rearrange(col, "(B V) T D -> B V T D", B=images.shape[0])
+        return {
+            "layer_tokens": layer_tokens,
+            "geo_tokens": self.geo_merge([*layer_tokens, col]),
+            "color_tokens": col,
+            "cam_token": tokens[-1][1],
+        }
 
-    def _fuse(self, layer_tokens: List[Tensor], nearest_idx: Tensor) -> Tensor:
-        """Iterative scene_tokens stream: gather + CA delta + SA per layer."""
-        D = self.backbone.embed_dim
-        idx = nearest_idx.unsqueeze(-1).expand(-1, -1, D)
-        # Initialize scene from the deepest layer's gathered tokens
-        scene = torch.gather(rearrange(layer_tokens[0], "B V T D -> B (V T) D"), 1, idx)
-        for l, blk_ca in enumerate(self.cross_attention):
-            keys = rearrange(layer_tokens[l], "B V T D -> B (V T) D")
-            queries = torch.gather(keys, 1, idx)
-            scene = scene + blk_ca(queries, keys, return_delta=True)
-            scene = self.self_attention[l](scene)
-        return scene
+    def cluster(self, geo_tokens: Tensor, images: Tensor, compression: float) -> Tuple[Tensor, ...]:
+        """k-means on the geometry tokens: (nearest_idx (B, K), assignments (B, V * T)).
 
-    def _color(self, images: Tensor, nearest_idx: Tensor) -> Tensor:
-        """Color skip: PatchEmbed all views, gather at shared k-means indices, CA in color_skip_dim."""
-        B = images.shape[0]
-        flat_imgs = rearrange(images, "B V C H W -> (B V) C H W")
-        color_tokens = rearrange(self.color_embed(flat_imgs), "(B V) T D -> B (V T) D", B=B)
-        D_c = color_tokens.shape[-1]
-        idx = nearest_idx.unsqueeze(-1).expand(-1, -1, D_c)
-        return self.color_cross_attention(torch.gather(color_tokens, 1, idx), color_tokens)
+        Both are arange(V * T) when the compression keeps every token (k-means skipped).
+        """
+        B, V, T, _ = geo_tokens.shape
+        if compression >= 1.0:
+            idx = torch.arange(V * T, device=geo_tokens.device).unsqueeze(0).expand(B, -1)
+            return idx, idx
 
-    # ------------------------- public forward -------------------------
+        K = max(1, int(V * T * compression))
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            return complexity_kmeans(
+                rearrange(geo_tokens, "B V T D -> B (V T) D"), K, images, self.patch_size
+            )
+
+    def fuse(self, enc: Dict[str, Tensor], scene_tokens: Tensor) -> Tensor:
+        """Refine the (B, K, D) scene tokens by attending into the encoded views."""
+        flat = lambda t: rearrange(t, "B V T D -> B (V T) D")  # noqa: E731
+        geo = flat(enc["geo_tokens"])
+        # Deepest layer first: coarse scene layout before fine detail.
+        for l in reversed(range(self.num_layers)):
+            scene_tokens = self.cross_attention[l](scene_tokens, geo, flat(enc["layer_tokens"][l]))
+            scene_tokens = self.self_attention[l](scene_tokens)
+        return self.color_ca(scene_tokens, geo, flat(enc["color_tokens"]))
+
+    def decode(
+        self, enc: Dict[str, Tensor], images: Tensor, compression: float = 1.0
+    ) -> Dict[str, object]:
+        """Compress, fuse and decode the encoded views (see forward for the outputs)."""
+        nearest_idx, assignments = self.cluster(enc["geo_tokens"], images, compression)
+        geo = rearrange(enc["geo_tokens"], "B V T D -> B (V T) D")
+        scene_tokens = cluster_mean(tokens=geo, assignments=assignments, K=nearest_idx.shape[1])
+        scene_tokens = self.fuse(enc, scene_tokens)
+        # fp32 heads regardless of the caller's autocast: bf16 rounding shows up directly in
+        # the Gaussian positions and the pose error.
+        with torch.autocast(images.device.type, enabled=False):
+            gaussians = self.gaussian_head(scene_tokens.float())
+            pose_enc = self.backbone.cam_dec(enc["cam_token"].float())
+        poses, cameras = decode_pose_encoding(pose_enc, images.shape[-2:])
+        return {
+            "gaussians": gaussians,
+            "poses": poses,
+            "cameras": cameras,
+            "scene_tokens": scene_tokens,
+            "nearest_idx": nearest_idx,
+            "assignments": assignments,
+        }
+
+    # ------------------------- forward -------------------------
 
     def forward(
         self,
         images: Tensor,
         cameras: Optional[Camera] = None,
         poses: Optional[Pose] = None,
-        use_priors: bool = False,
         compression: float = 1.0,
-    ) -> Gaussians:
-        """Predict Gaussians from multi-view images.
+    ) -> Dict[str, object]:
+        """Predict Gaussians and the input cameras from multi-view images.
 
         Args:
-            images: (B, V, 3, H, W) float in [0, 1].
-            cameras: (B, V) Camera. Required when `use_priors=True`.
-            poses: (B, V) Pose. Required when `use_priors=True`.
-            use_priors: if True, inject pose+intrinsics tokens at the backbone's `alt_start`.
-            compression: query-sampling ratio in (0, 1]. 1.0 disables k-means (all tokens used).
+            images: (B, V, 3, H, W) in [0, 1], H and W divisible by the patch size.
+            cameras, poses: Optional (B, V) priors injected into the backbone (c2w poses).
+            compression: Fraction of the V * T tokens kept as scene tokens, in (0, 1]; 1.0
+                skips k-means.
 
         Returns:
-            Gaussians with batch shape (B, N_gaussians).
+            gaussians: Gaussians (B, K * G).
+            poses: Predicted c2w poses (B, V) of the input views (first view ~ identity).
+            cameras: Predicted cameras (B, V) at the input resolution.
+            scene_tokens: Scene tokens (B, K, D), the GaussianHead input.
+            nearest_idx: (B, K) token nearest to each cluster.
+            assignments: (B, V * T) cluster of each token.
         """
-        prior_pose, prior_camera = (poses, cameras) if use_priors else (None, None)
-        features = self._backbone_features(images, prior_camera, prior_pose)
-        layer_tokens = self._prepare(features)
-        # K-means runs on the deepest (last) layer.
-        nearest_idx = self._cluster(layer_tokens[0], compression)
-        scene = self._fuse(layer_tokens, nearest_idx)
-        color_feats = self._color(images, nearest_idx)
-        return self.gaussian_head(torch.cat([scene, color_feats], dim=-1))
+        return self.decode(self.encode(images, cameras, poses), images, compression)

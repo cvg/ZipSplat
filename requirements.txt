@@ -1,6 +1,7 @@
 torch
 numpy<2
 einops
+tqdm
 matplotlib
 gsplat
 plyfile
