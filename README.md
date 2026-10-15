@@ -44,11 +44,12 @@ python -m pip install -e .
 python -m pip install -e ".[xformers]"
 ```
 
-Rendering uses [gsplat](https://github.com/nerfstudio-project/gsplat) and requires a CUDA GPU; the
-pretrained weights are downloaded automatically on first use.
+Rendering uses [gsplat](https://github.com/nerfstudio-project/gsplat) and requires a CUDA GPU. 
+The pretrained weights are downloaded automatically on first use.
 
 The easiest way to try ZipSplat is the interactive viewer: reconstruct a scene and explore it live
-in your browser. Drag the **compression** slider to trade Gaussians for quality in real time, and
+in your browser.
+Drag the **compression** slider to trade Gaussians for quality in real time, and
 toggle **token coloring** to see how each token's group of Gaussians is placed:
 
 ```bash
@@ -65,12 +66,14 @@ import math, torch
 from zipsplat import ZipSplat, Camera, Pose, load_image, viz
 
 model = ZipSplat(weights="zipsplat").cuda().eval()
-images = [load_image(p) for p in paths] # raw images, any size (auto-resized)
-gaussians = model(images)[0] # feed-forward 3D Gaussians
+images = [load_image(p) for p in paths] # raw images, any size (auto-cropped and resized)
+pred = model(images)                    # forward pass + test-time BA, no poses or intrinsics needed
+gaussians = pred["gaussians"]           # 3D Gaussians
+poses, cameras = pred["poses"], pred["cameras"]  # c2w poses + intrinsics of the input images
 
 # render a novel view
 camera = Camera.from_fov(math.radians(60), w=512, h=512)
-pose = Pose.from_Rt(torch.eye(3), torch.zeros(3)) # identity pose
+pose = Pose.from_Rt(torch.eye(3), torch.zeros(3)) # identity pose = the first input view
 rgb, info = gaussians.render(camera, pose)
 
 # export
@@ -78,8 +81,9 @@ gaussians.save_ply("scene.ply")                             # open in any 3DGS v
 viz.turntable(gaussians, "turntable.mp4", sweep_deg=None)   # wiggle orbit video
 ```
 
-`gaussians` is a [`Gaussians`](zipsplat/gaussians.py) object; `gaussians.save_ply(...)` writes a standard 3DGS `.ply` you can
-drop into [SuperSplat](https://playcanvas.com/supersplat/editor) or any Gaussian-splat viewer.
+Everything lives in the frame of the first input view. `gaussians` is a
+[`Gaussians`](zipsplat/gaussians.py) object. 
+`gaussians.save_ply(...)` writes a standard 3DGS `.ply` you can drop into [SuperSplat](https://playcanvas.com/supersplat/editor) or any Gaussian-splat viewer. 
 
 <details>
 <summary><b>Input: images, a video, or a single image</b></summary>
@@ -87,28 +91,27 @@ drop into [SuperSplat](https://playcanvas.com/supersplat/editor) or any Gaussian
 ```python
 from zipsplat import load_image, load_video
 
-# multiple images (any sizes; center-cropped to square and resized internally)
-gaussians = model([load_image(p) for p in paths])[0]
+# multiple images (any sizes: center-cropped to the nearest training aspect ratio and resized)
+gaussians = model([load_image(p) for p in paths])["gaussians"]
 
 # a single image
-gaussians = model([load_image("photo.jpg")])[0]
+gaussians = model([load_image("photo.jpg")])["gaussians"]
 
 # a video clip (evenly samples num_frames across the clip)
-gaussians = model(load_video("assets/examples/drone.mp4", num_frames=24))[0]
+gaussians = model(load_video("assets/examples/drone.mp4", num_frames=24))["gaussians"]
 ```
-
 The model handles 1-24+ views; more views give wider coverage, fewer give a tighter reconstruction.
 </details>
 
 <details>
 <summary><b>Compression: fewer Gaussians</b></summary>
 
-`compression` is the query-sampling ratio in `(0, 1]`. `1.0` (default) uses every token; lower values
+`compression` is the query-sampling ratio in `(0, 1]`. `1.0` (default) uses every token. Lower values
 run k-means to keep a subset, shrinking the Gaussian count with graceful quality falloff.
 
 ```python
-gaussians = model(images, compression=1.0)   # full quality
-gaussians = model(images, compression=0.25)  # ~4x fewer Gaussians
+gaussians = model(images, compression=1.0)["gaussians"]   # full quality
+gaussians = model(images, compression=0.25)["gaussians"]  # ~4x fewer Gaussians
 print(gaussians.num_gaussians)
 ```
 </details>
@@ -122,8 +125,7 @@ rgb, info = gaussians.render(camera, pose)               # mode="RGB" by default
 rgbd, _ = gaussians.render(camera, pose, mode="RGB+ED")  # append expected depth
 ```
 
-Cameras/poses are moved to the scene's device automatically. `info["alphas"]` holds the rendered
-opacity. Build cameras with `Camera.from_fov`, `Camera.from_focal`, or `Camera.from_K`.
+Cameras/poses are moved to the scene's device automatically. Build cameras with `Camera.from_fov`, `Camera.from_focal`, or `Camera.from_K`.
 </details>
 
 <details>
@@ -138,31 +140,43 @@ viz.turntable(gaussians, "wiggle.mp4", sweep_deg=None) # gentle wiggle (best for
 </details>
 
 <details>
-<summary><b>Camera priors (optional)</b></summary>
+<summary><b>TokenBA</b></summary>
 
-If you have calibrated cameras and poses, pass them with `use_priors=True` to inject them into the
-backbone. Intrinsics are adjusted automatically for the internal resize.
+By default (`ba=True`) the prediction is refined against the input views (TokenBA): the input
+poses are re-solved by robust PnP on the token-patch correspondences plus a short photometric
+polish, then the scene tokens and poses are optimized jointly through the frozen Gaussian head. It
+stays pose-free and needs a CUDA GPU (pass `ba=False` on CPU). Pass a dict instead of `True` to
+change TokenBA's settings (see [`zipsplat/token_ba.py`](zipsplat/token_ba.py)):
 
 ```python
-gaussians = model(images, cameras=cameras, poses=poses, use_priors=True)
+pred = model(images, ba=False)                     # feed-forward only
+pred = model(images, ba={"verbose": True})         # progress bars
+pred = model(images, ba={"joint_steps": 32})       # shorter joint refinement (default 96)
+pred = model(images, ba={"joint_tol": None})       # no early stopping: run all joint steps
+pred = model(images, ba={"rounds": 8})             # more camera / token rounds (default 4)
+
+pred = model(images, ba=False)                     # or refine later, e.g. with other settings
+refined = model.refine(pred, joint_steps=32, verbose=True)
 ```
 </details>
 
 ## Models
 
-| Name       | Backbone  | Train res | Notes                                      |
-| ---------- | --------- | --------- | ------------------------------------------ |
-| `zipsplat` | DA3-Giant | 252 px    | Default release checkpoint (RE10K + DL3DV) |
+| `weights=`     | Backbone  | Input                          | Training data                                                                                            |
+| -------------- | --------- | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `zipsplat`     | DA3-Giant | long edge 504, 7 aspect ratios | RE10K, DL3DV, ScanNet++, ARKitScenes, Hypersim, UnrealStereo4K, BlendedMVS, CO3D, WildRGB-D, G-Objaverse |
+| `zipsplat-252` | DA3-Giant | 252 x 252                      | RE10K, DL3DV                                                                                             |
 
-Weights are hosted on the [Hugging Face Hub](https://huggingface.co/veichta/zipsplat) and fetched on
-first use. You can also pass a local path or URL: `ZipSplat(weights="path/to/checkpoint.tar")`.
+`zipsplat` is the default and the model to use in the wild. The paper's numbers are from
+`zipsplat-252`. The weights are hosted on the [Hugging Face Hub](https://huggingface.co/veichta/zipsplat)
+and fetched on first use. You can also pass a local path or URL: `ZipSplat(weights="path/to/checkpoint.tar")`.
 
 ## Training and evaluation
 
 The training and evaluation code lives in [`splatfactory`](splatfactory), a general library for
 feed-forward Gaussian Splatting. It streams large multi-view datasets, composes models and
 losses through Hydra configs, trains across multiple GPUs, and benchmarks novel-view synthesis on a
-suite of standard datasets. ZipSplat is the model we train with it; the recipes below reproduce the
+suite of standard datasets. ZipSplat is the model we train with it, and the recipes below reproduce the
 released checkpoint and the paper tables.
 
 ### Setup
@@ -193,7 +207,7 @@ pip install -e "splatfactory/[xformers]"
 We use a [gsplat fork](https://github.com/JoannaCCJH/gsplat) rather than upstream because it exposes
 a per-Gaussian `activated` flag from the rasterizer. Training uses it to detach Gaussians that were
 already rendered from the geometry (chamfer) loss, so that term only supervises the Gaussians the
-images don't already constrain. Inference works with stock gsplat; this fork only matters for
+images don't already constrain. Inference works with stock gsplat. This fork only matters for
 training.
 
 <details>
@@ -203,7 +217,7 @@ Every dataset is converted into a common format: uncompressed tar shards of scen
 cameras, poses, and optional depth) written under `data/<dataset>/<HxW>/{train,test}-scenes/`. The
 shipped configs point `data.dataset_dir` at these paths, so the default commands below produce
 exactly what training and evaluation expect. Each dataset has a `download` step (fetch the raw data)
-and a `convert` step (pack it into shards); add `--num-workers N` to parallelize either. **For
+and a `convert` step (pack it into shards). Add `--num-workers N` to parallelize either. **For
 evaluation you only need the test split**, so pass `--split test` to `convert` where available.
 
 <details>
@@ -225,7 +239,7 @@ python -m splatfactory.datasets.scripts.re10k.convert --split test
 <summary><b>DL3DV</b></summary>
 
 Gated on Hugging Face, so accept the dataset terms and run `huggingface-cli login` first. We use the
-960P release (540x960). Redistribution is not permitted; the script pulls directly from Hugging Face
+960P release (540x960). Redistribution is not permitted, so the script pulls directly from Hugging Face
 per the DL3DV terms.
 
 ```bash
@@ -259,7 +273,7 @@ Two optional post-processing tools operate on any shard directory:
 
 **Depth.** Every dataset needs per-view depth maps, for both training and evaluation: training uses them for
 the depth and chamfer loss, and the data pipeline uses them to normalize each scene's scale. The
-shards from `convert` carry images and poses but no depth; add it in place with
+shards from `convert` carry images and poses but no depth. Add it in place with
 the [`extract_depth`](splatfactory/datasets/scripts/extract_depth.py) script, which runs DA3 on each
 scene (needs a GPU and the `depth-anything-3` package). Run it on every shard directory you train or
 evaluate on:
@@ -279,7 +293,7 @@ It can be parallelized across GPUs with torchrun:
 
 ## Evaluation
 
-With the data prepared, evaluate the **released model** with the `zipsplat_eval` config; its weights
+With the data prepared, evaluate the **released model** with the `zipsplat_eval` config. Its weights
 are downloaded automatically, so no local checkpoint is needed:
 
 ```bash
@@ -311,7 +325,7 @@ Evaluate your own checkpoint:
 python -m splatfactory.eval.run dl3dv_benchmark --checkpoint <exp_name> eval.num_views=6
 ```
 
-Results (PSNR / SSIM / LPIPS, pose-free; DA3 and YoNoSplat for reference):
+Results (PSNR / SSIM / LPIPS, pose-free, with DA3 and YoNoSplat for reference):
 
 | Method                | 6 views               | 12 views              | 24 views              |
 | --------------------- | --------------------- | --------------------- | --------------------- |
@@ -339,7 +353,7 @@ Evaluate your own checkpoint:
 python -m splatfactory.eval.run re10k_benchmark --checkpoint <exp_name> eval.num_views=6
 ```
 
-Results (pose-free; DA3 and YoNoSplat for reference):
+Results (pose-free, with DA3 and YoNoSplat for reference):
 
 | Method                | PSNR  | SSIM  | LPIPS |
 | --------------------- | ----- | ----- | ----- |
@@ -369,7 +383,7 @@ Evaluate your own checkpoint:
 python -m splatfactory.eval.run mipnerf360_benchmark --checkpoint <exp_name> eval.num_views=32
 ```
 
-Results (PSNR / SSIM / LPIPS, pose-free; DA3 and YoNoSplat for reference):
+Results (PSNR / SSIM / LPIPS, pose-free, with DA3 and YoNoSplat for reference):
 
 | Method                | 32 views              | 64 views              | 128 views             |
 | --------------------- | --------------------- | --------------------- | --------------------- |
@@ -403,8 +417,8 @@ python -m splatfactory.train zipsplat --conf zipsplat
 torchrun --nproc_per_node=4 -m splatfactory.train zipsplat --conf zipsplat --distributed
 ```
 
-`zipsplat` is the experiment name (checkpoints are written to `outputs/training/zipsplat/`); use any
-name you like. The released model trains on the 50/50 RE10K + DL3DV mix at 252px for 450K steps; our
+`zipsplat` is the experiment name (checkpoints are written to `outputs/training/zipsplat/`), use any
+name you like. The released model trains on the 50/50 RE10K + DL3DV mix at 252px for 450K steps. Our
 run used 16 GPUs (4 nodes x 4) at a global batch size of 384, so scale `data.batch_size` to your
 hardware. Add `--restore` to resume an interrupted run. Configs are [Hydra](https://hydra.cc), so
 anything can be overridden from the command line, e.g. a smaller backbone:
