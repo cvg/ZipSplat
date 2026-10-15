@@ -21,7 +21,7 @@
 </h3>
 
 <p align="center">
-  <img src="https://github.com/cvg/ZipSplat/releases/download/assets-v1/teaser.avif" alt="ZipSplat teaser" width="100%">
+  <img src="https://github.com/cvg/ZipSplat/releases/download/assets-v1/teaser.webp" alt="ZipSplat teaser" width="100%">
   <br>
   <em>ZipSplat turns unposed images into 3D Gaussians in seconds, with high quality and a Gaussian budget you choose at inference.</em>
 </p>
