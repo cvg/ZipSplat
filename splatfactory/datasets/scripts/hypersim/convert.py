@@ -52,7 +52,7 @@ EUCLIDEAN_TO_Z = (
 
 
 def load_splits(meta_dir: Path) -> dict[tuple[str, str], str]:
-    """(scene, cam) -> split; val merged into train."""
+    """Split of each (scene, cam), with val merged into train."""
     out = {}
     with open(meta_dir / "metadata_images_split_scene_v1.csv") as f:
         for row in csv.DictReader(f):

@@ -6,9 +6,8 @@ Assets per video (default set = what convert.py needs, ~2-4GB per 10 videos):
   - lowres_depth.zip: 256x192 LiDAR depth (uint16 PNG, mm)
   - lowres_wide.traj: camera trajectory (timestamp, axis-angle, translation)
 
-The full raw variant is multi-TB across 5047 videos -- use --max-scenes to
-download a sample (first N Training + N Validation videos by metadata order).
-Zips are kept compressed; convert.py reads them directly.
+The full raw variant is several TB across 5047 videos. --max-scenes downloads a sample (the
+first N Training and N Validation videos). Zips stay compressed, convert.py reads them directly.
 
 Usage:
     python -m splatfactory.datasets.scripts.arkitscenes.download --max-scenes 20
@@ -67,7 +66,7 @@ MISSING_TRAJ_IDS = {
 
 
 def load_metadata(output_dir: Path) -> list[dict]:
-    """Split rows; also fetches Apple's metadata.csv (sky_direction per video) for convert."""
+    """Split rows, plus Apple's metadata.csv (sky_direction per video) for convert.py."""
     output_dir.mkdir(parents=True, exist_ok=True)
     for name, url in (
         ("raw_train_val_splits.csv", SPLITS_CSV),

@@ -1,14 +1,12 @@
 """Download CO3Dv2 category zips from the official links manifest.
 
-Full dataset is ~5.5TB (51 categories, multi-chunk zips per category) -- too big
-to hold locally. Sampling modes:
-  - --single-sequence: official small variant (~9GB, ~2 sequences/category)
-  - --max-chunks N: only the first N zip chunks per category (chunk 000 carries
-    frame_annotations.jgz / set_lists; sequences split across missing chunks are
-    dropped at convert time)
-  - --categories: subset of categories
+The full dataset is ~5.5 TB (51 categories, several zip chunks each). Sampling modes:
+  - --single-sequence: the official small variant (~9 GB, ~2 sequences per category).
+  - --max-chunks N: the first N zip chunks per category. Chunk 000 carries the annotations,
+    and sequences split across missing chunks are dropped at convert time.
+  - --categories: a subset of the categories.
 
-Zips are kept compressed; convert.py reads them directly.
+Zips stay compressed, convert.py reads them directly.
 
 Usage:
     python -m splatfactory.datasets.scripts.co3d.download --single-sequence

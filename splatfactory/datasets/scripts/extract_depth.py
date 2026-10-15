@@ -1,9 +1,8 @@
 """Extract DA3 depth for tar shards, in place.
 
-Round-robin chunking when --max-views is set (each chunk spans the full scene
-trajectory for globally consistent depth; validated in playground/test_depth_chunking.py).
-In-place rewrite via .tmp + atomic rename. Per-rank shard partitioning - no
-concurrent writes to the same tar.
+With --max-views, long scenes are split round-robin into chunks that each span the whole
+trajectory, so the depth stays consistent across the scene. Shards are rewritten through a
+temporary file and an atomic rename, and each rank owns its own shards.
 
 Usage:
     # Single GPU

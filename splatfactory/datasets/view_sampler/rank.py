@@ -1,17 +1,10 @@
-"""Covisibility-window view sampler for unordered or room-scan captures.
+"""Covisibility view sampler for unordered or room-scan captures.
 
-Needs the per-scene covisibility members written into the shards by
-`splatfactory/datasets/scripts/precompute_rankings.py` (`{key}.rankings.npy`, `{key}.overlaps.npy`):
-for every view its k most covisible views, with the measured overlap fraction. They arrive
-with the raw scene, so nothing is held in memory across scenes.
-
-Sampling, per scene: a random reference view; the far context view from the views whose
-overlap with the reference lies in [min_overlap, max_overlap] (gap mode "min" takes the
-least covisible of them = hard, "max" the most = easy); the remaining context and all
-target views from the views with overlap >= min_overlap. Everything sampled therefore
-shares at least min_overlap of its content with the reference, independent of scene size
-and frame order. Scenes too sparse to fill the request fall back to the next most
-covisible views.
+Reads the per-view covisibility rankings that `datasets/scripts/precompute_rankings.py` writes
+into the shards. Per scene, it draws a random reference view, the far context view among the
+views whose overlap with the reference lies in [min_overlap, max_overlap], and the remaining
+context and target views among those with overlap >= min_overlap. Sparse scenes are topped up
+with the next most covisible views.
 
 Author: Alexander Veicht
 """
@@ -27,13 +20,13 @@ logger = get_logger(__name__)
 
 
 class RankViewSampler(BaseViewSampler):
-    """Samples context/target views by measured covisibility with a reference view."""
+    """Samples context and target views by their covisibility with a reference view."""
 
     default_conf = {
         "min_overlap": 0.2,  # every sampled view shares >= this with the reference
         "max_overlap": 0.8,  # far context view drawn from [min_overlap, max_overlap]
     }
-    # Scene members this sampler reads; the dataset skips scenes that lack them.
+    # scene members this sampler reads, the dataset skips scenes without them
     required_scene_keys = ("rankings", "overlaps")
 
     def _init(self, conf):
@@ -43,7 +36,7 @@ class RankViewSampler(BaseViewSampler):
         return 3
 
     def _fill(self, chosen: list[int], pool: list[int], fallback: list[int], n: int) -> list[int]:
-        """n random views from pool (minus chosen); fallback order tops up sparse scenes."""
+        """n random views of `pool` not yet chosen, topped up from `fallback` in order."""
         avail = [v for v in pool if v not in chosen]
         out = random.sample(avail, min(n, len(avail)))
         for v in fallback:
@@ -65,7 +58,7 @@ class RankViewSampler(BaseViewSampler):
             raise KeyError(f"Scene {scene_id} carries no covisibility rankings")
         ref = random.randint(0, len(scene["rankings"]) - 1)
         ranked = scene["rankings"][ref, 1:].tolist()  # most covisible first, self excluded
-        # float32 on disk; rounding restores the 3-decimal scores the thresholds were tuned on
+        # stored as float32, rounding restores the 3-decimal scores the thresholds refer to
         scores = np.round(scene["overlaps"][ref, 1:].astype(np.float64), 3).tolist()
         score_of = dict(zip(ranked, scores))
         lo, hi = self.conf.min_overlap, self.conf.max_overlap

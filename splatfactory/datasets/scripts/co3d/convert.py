@@ -1,21 +1,20 @@
 """Convert CO3Dv2 sequences to canonical tar shards.
 
-Reads category zips (co3d/<category>_NNN.zip, optionally *_singlesequence.zip)
-or extracted category dirs. Selection follows DUSt3R's preprocess_co3d.py:
-sequences in the fewview_train split (fallback manyview_dev_0) with
-viewpoint_quality_score > --min-quality, top --max-per-category by frame count;
-a per-category random --test-fraction becomes test-scenes.
+Reads category zips (co3d/<category>_NNN.zip, optionally *_singlesequence.zip) or extracted
+category dirs. The selection follows DUSt3R's preprocess_co3d.py: sequences of the
+fewview_train split (fallback manyview_dev_0) with viewpoint_quality_score > --min-quality,
+the --max-per-category longest per category. A random --test-fraction per category becomes
+the test split.
 
-Conventions applied (matching scannetpp/blendedmvs converts):
-  - Cameras: PyTorch3D NDC -> OpenCV pinhole per frame (DUSt3R math), then the
-    principal point is centered via crop_to_principal_point -> resize_to_cover
-    -> crop_to_ar. Target size is per scene: first frame's aspect with the
-    short side capped at --short-side (sequences differ in size/orientation,
-    so the output tree is named "<short-side>s", not <HxW>).
+Conventions:
+  - Cameras: PyTorch3D NDC to OpenCV pinhole per frame (DUSt3R math), principal point centred
+    (crop_to_principal_point, resize_to_cover, crop_to_ar). The target size is per scene,
+    the first frame's aspect with the short side capped at --short-side, so the output tree
+    is named "<short-side>s" rather than <HxW>.
   - Poses: OpenCV c2w Pose.data_ [R.flatten(), t].
-  - Images re-encoded JPEG q95 (resampled).
-  - Depth: uint16 PNG bit-cast to float16 * scale_adjustment, depth_mask == 0
-    and <= 0 -> invalid; same geometry as the image; log-uint8 WebP.
+  - Images re-encoded as JPEG q95, since they are resampled.
+  - Depth: uint16 PNG bit-cast to float16 times scale_adjustment. depth_mask == 0 and
+    values <= 0 are invalid. Same geometry as the image, log-uint8 WebP.
 
 Usage:
     python -m splatfactory.datasets.scripts.co3d.convert --num-workers 8

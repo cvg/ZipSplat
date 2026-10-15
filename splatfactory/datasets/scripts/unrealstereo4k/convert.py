@@ -1,40 +1,28 @@
 """Convert UnrealStereo4K(-Q) stereo sequences to canonical tar shards.
 
-Raw layout (`<raw-dir>`, written by download.py; zips are read directly, an
-extracted `<scene>/` dir with the same members works too):
-  - <scene>.zip: <scene>/{Image0,Image1}/NNNNN.jpg -- left/right renders, 960x540
-    (HF quarter-res release; the 3840x2160 originals have the same layout as .png)
-  - <scene>.zip: <scene>/{Disp0,Disp1}/NNNNN.npy -- float32 disparity in pixels of
-    that resolution, aligned with the left/right image
-  - <scene>_extrinsics.zip: <scene>/{Extrinsics0,Extrinsics1}/NNNNN.txt -- line 1 the
-    3x3 K at 3840x2160 (fx = fy = 1920, pp exactly centered), line 2 the 3x4
-    world-to-camera [R|t] (same parsing as CUT3R's preprocess_unreal4k.py)
+Raw layout in `<raw-dir>`, as written by download.py. Zips are read directly, extracted
+`<scene>/` dirs with the same members work too:
+  - <scene>.zip: <scene>/{Image0,Image1}/NNNNN.jpg, the left and right renders at 960x540.
+  - <scene>.zip: <scene>/{Disp0,Disp1}/NNNNN.npy, float32 disparity in pixels at that size.
+  - <scene>_extrinsics.zip: <scene>/{Extrinsics0,Extrinsics1}/NNNNN.txt, the 3x3 K at
+    3840x2160 on line 1 and the 3x4 world-to-camera [R|t] on line 2.
 
-Each sequence is a static Unreal Engine environment rendered from 1000 (00008: 200)
-stereo pairs scattered through it (median step between consecutive frames ~1-4 m and
-~23 deg, not a smooth video). Each sequence is split by frame index into consecutive
-chunks of --chunk-pairs stereo pairs (default 100 -> 200 views, ~110 MB, since the
-loader holds whole records in worker memory), one scene record per chunk keyed
-`<scene>_<chunk:03d>`. Views are interleaved [L0, R0, L1, R1, ...]; cam_ids (0 = left,
-1 = right) and time_ids (frame index) are stored so the stereo partner of a view is
-recoverable.
+Each sequence is a static Unreal Engine environment rendered from 1000 (00008: 200) stereo
+pairs scattered through it. It is split into chunks of --chunk-pairs consecutive pairs, one
+scene record per chunk keyed `<scene>_<chunk:03d>`. Views are interleaved [L0, R0, L1, R1, ...],
+and cam_ids (0 left, 1 right) and time_ids (frame index) identify the stereo partner of a view.
 
-Conventions applied:
-  - Intrinsics: the 4K K scaled by (w / 3840, h / 2160) to the stored resolution.
-  - Poses: the UE world is left-handed (det R = -1 for every frame), so the world
-    Y axis is flipped (w2c @ diag(1, -1, 1)); the camera frame is already OpenCV
-    (x right, y down, z forward; the right camera sits at +baseline along x).
-    Stored as c2w Pose.data_ [R.flatten(), t]. Units as rendered (~meters).
-  - Depth: z = fx * baseline / disparity with fx at the stored resolution and the
-    per-frame baseline from the two extrinsics (0.2 in 00000, 0.5 in 00001/00008).
-    Invalid (disp <= 0, non-finite) or sky / far plane (z > MAX_DEPTH; the renders
-    put it at ~1e4, with an empty gap above ~500) -> -1, then log-uint8 WebP.
-  - Geometry: per-frame pp from the Extrinsics K (not assumed centered), then
-    pp-centering crop -> resize_to_cover -> crop_to_ar to --target-size, K composed
-    through every transform and asserted centered within 1.5 px
-    (default 540x960 = the -Q native size: an exact identity, so the JPEGs pass
-    through verbatim; any other size re-encodes JPEG q95, depth goes through the
-    same geometry with NaN-marked INTER_LINEAR).
+Conventions:
+  - Intrinsics: the 4K K scaled to the stored resolution.
+  - Poses: the world Y axis is flipped (w2c @ diag(1, -1, 1)), since the Unreal world is
+    left-handed. The camera frame is already OpenCV, the right camera at +baseline along x.
+    Stored as c2w Pose.data_ [R.flatten(), t] in the rendered units (~meters).
+  - Depth: z = fx * baseline / disparity, with the per-frame baseline from the two
+    extrinsics. Invalid disparity and the far plane (z > MAX_DEPTH) become -1, then
+    log-uint8 WebP.
+  - Geometry: principal point centred, resized and cropped to --target-size. The default
+    540x960 is the native size, so the JPEGs pass through verbatim. Other sizes re-encode
+    them as JPEG q95, with the depth resized alongside.
 
 Splits (by sequence): 00000-00007 train, 00008 (the official out-of-domain set) test.
 
@@ -147,7 +135,7 @@ def _apply_geometry(img, cx, cy, target):
 
 
 def _apply_geometry_depth(depth, cx, cy, target):
-    """Same size math as _apply_geometry; invalid stays NaN through the resize."""
+    """_apply_geometry for depth, invalid pixels stay NaN through the resize."""
     d, _ = crop_to_principal_point(depth, cx, cy)
     th, tw = target
     h, w = d.shape

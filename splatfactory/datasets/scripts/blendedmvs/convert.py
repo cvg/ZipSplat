@@ -6,17 +6,15 @@ Raw layout (extracted `<root>/BlendedMVS/<pid>/`):
   - cams/pair.txt -- MVS neighbor rankings (not used here)
   - rendered_depth_maps/NNNNNNNN.pfm -- planar z-depth in meters (from the mesh)
 
-Conventions applied (matching scannetpp/dycheck converts):
-  - Principal point is centered per frame via crop_to_principal_point ->
-    resize_to_cover -> crop_to_ar to exactly 576x768 (pp offsets are <= ~14px;
-    K varies per frame in some scenes, so the plan is per-frame).
-  - Poses stored as OpenCV c2w Pose.data_ [R.flatten(), t] (cam txt is w2c).
-  - Images re-encoded JPEG q95 (resampled -> passthrough impossible).
-  - Depth gets the same geometry (invalid -> NaN, INTER_LINEAR, NaN -> -1),
-    then log-uint8 WebP via encode_depth. Missing/empty PFMs -> all-invalid.
-  - orientation.json (29 sideways-captured scenes) is NOT applied: training
-    uses relative poses, so world orientation is irrelevant; image content
-    stays as captured.
+Conventions:
+  - Principal point centred per frame (crop_to_principal_point, resize_to_cover,
+    crop_to_ar) to exactly 576x768. K varies per frame in some scenes.
+  - Poses stored as OpenCV c2w Pose.data_ [R.flatten(), t] (the cam files are w2c).
+  - Images re-encoded as JPEG q95, since they are resampled.
+  - Depth gets the same geometry (invalid NaN, INTER_LINEAR, NaN to -1), then log-uint8
+    WebP. Missing or empty PFMs give all-invalid depth.
+  - orientation.json (29 sideways scenes) is not applied. Training uses relative poses, so
+    the world orientation does not matter, and the images stay as captured.
 
 Splits from project_lists/: train = BlendedMVS.txt minus validation_list.txt
 (106), test = validation_list.txt (7).
@@ -110,7 +108,7 @@ def _apply_geometry(img: np.ndarray, cx, cy, target) -> np.ndarray:
 
 
 def _apply_geometry_depth(depth: np.ndarray, cx, cy, target) -> np.ndarray:
-    """Same size math as _apply_geometry; invalid stays NaN through the resize."""
+    """_apply_geometry for depth, invalid pixels stay NaN through the resize."""
     d, _ = crop_to_principal_point(depth, cx, cy)
     th, tw = target
     h, w = d.shape

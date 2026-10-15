@@ -1,30 +1,24 @@
 """Convert ScanNet++ raw scenes to canonical tar shards (DSLR + iPhone).
 
-Single-environment pipeline (splatfactory), NO intermediate files: depth is
-rendered on the GPU with open3d's Filament off-screen renderer and encoded
-straight into the shards; nothing is written to disk except the final tars.
+No intermediate files: the mesh depth is rendered on the GPU with open3d's off-screen renderer
+and encoded straight into the shards.
 
 Per device:
-  - DSLR  : `resized_images/*.JPG` (distorted OPENCV_FISHEYE) undistorted to
-            PINHOLE in memory -- bit-identical to the ScanNet++ toolkit
-            (estimateNewCameraMatrix balance=0, cx/cy centered, CV_32FC1 remap,
-            INTER_LINEAR + BORDER_REFLECT_101) -- + mesh depth at the new K.
-  - iPhone: every registered frame decoded from `rgb.mkv` (cv2), undistorted in
-            memory (OPENCV model -> PINHOLE), + mesh depth at the same intrinsics.
-            iPhone has no NVS test split, so it is extra training data.
+  - DSLR: `resized_images/*.JPG` (OPENCV_FISHEYE) undistorted to PINHOLE in memory, exactly
+    as the ScanNet++ toolkit does, plus the mesh depth at the new K.
+  - iPhone: every registered frame of `rgb.mkv`, undistorted in memory (OPENCV to PINHOLE),
+    plus the mesh depth. The iPhone captures have no NVS test split and only add training data.
 
-Camera/pose conventions (verified against the existing shards):
-  - `cameras` = Camera.data_ = [w, h, fx, fy, cx, cy] from transforms.
-  - `poses`   = Pose.data_   = [R.flatten(), t] of the cam2world in OpenCV
-                convention (nerfstudio c2w with columns 1,2 negated).
-  - depth is rendered with the camera placed in the mesh's COLMAP world
-    (nerfstudio -> colmap), but stored as view-space planar z, so it stays
-    consistent with the OpenCV-convention `poses` above.
+Conventions:
+  - `cameras` = Camera.data_ = [w, h, fx, fy, cx, cy] from the transforms.
+  - `poses` = Pose.data_ = [R.flatten(), t] of the OpenCV c2w (nerfstudio c2w with columns
+    1 and 2 negated).
+  - Depth is stored as view-space planar z, consistent with `poses`.
 
-Output layout: <output-dir>/<HxW>/<device>/<split>-scenes/shard-*.tar
-  <HxW> is the actual output size: full res is per device (dslr 1168x1752, iphone
-  1440x1920); --max-side N crops both to DSLR's aspect ratio for a common size
-  (e.g. 1080 -> 720x1080). splits: train -> nvs_sem_train, test -> nvs_sem_val.
+Output layout: <output-dir>/<HxW>/<device>/<split>-scenes/shard-*.tar, where <HxW> is the
+output size: full resolution per device (dslr 1168x1752, iphone 1440x1920), or with
+--max-side N both cropped to the DSLR aspect ratio (e.g. 1080 gives 720x1080). Splits:
+train is nvs_sem_train, test is nvs_sem_val.
 
 Usage:
     python -m splatfactory.datasets.scripts.scannetpp.convert --num-workers 12
@@ -90,7 +84,7 @@ def _ns_c2w_to_colmap_w2c(c2w_opengl) -> np.ndarray:
 
 
 class MeshDepthRenderer:
-    """Reusable off-screen depth renderer; rebuilds only when the frame size changes."""
+    """Off-screen depth renderer, rebuilt only when the frame size changes."""
 
     def __init__(self):
         self._r = None
@@ -110,7 +104,7 @@ class MeshDepthRenderer:
         self._r.scene.add_geometry("mesh", mesh, self._mat)
 
     def render(self, w, h, fx, fy, cx, cy, c2w_opengl) -> np.ndarray:
-        """Render view-space planar z depth (meters); invalid pixels = -1.0."""
+        """View-space planar z depth in meters, -1 at invalid pixels."""
         import open3d as o3d  # lazy: optional dependency
 
         intr = o3d.camera.PinholeCameraIntrinsic(w, h, fx, fy, cx, cy)
@@ -191,11 +185,10 @@ def _dslr_image_reader(dslr_dir: Path):
 
 
 def _geometry_plan(w, h, fx, fy, cx, cy, target):
-    """Center the principal point (crop_to_principal_point), then optionally
-    resize_to_cover + crop_to_ar to `target` -- intrinsics composed through every
-    transform so image, depth, and camera stay consistent (cx, cy end at the image
-    center). target is (out_h, out_w) or None (full res). Returns the output camera
-    (out_w, out_h, fx, fy, cx, cy); _apply_geometry replays the same ops per frame.
+    """Output camera (out_w, out_h, fx, fy, cx, cy) after centring the principal point.
+
+    With a `target` (out_h, out_w), the frame is also resized and cropped to it. The
+    intrinsics follow every step, and _apply_geometry replays the same steps per frame.
     """
     probe = np.zeros((h, w, 3), np.uint8)
     probe, t = crop_to_principal_point(probe, cx, cy)
@@ -262,7 +255,7 @@ def _fisheye_undistort_maps(tr: dict):
 def process_dslr_scene(scene_id: str, data_root: Path, target=None) -> dict:
     scene_dir = data_root / "data" / scene_id
     dslr = scene_dir / "dslr"
-    # Distorted (OPENCV_FISHEYE) transforms; undistorted in-pipeline -> PINHOLE.
+    # fisheye (OPENCV_FISHEYE) transforms, undistorted to PINHOLE below
     tr = _load_transforms(dslr / "nerfstudio" / "transforms.json")
     new_K, map1, map2, w, h = _fisheye_undistort_maps(tr)
     fx, fy = float(new_K[0, 0]), float(new_K[1, 1])
@@ -397,8 +390,7 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Process only first N scenes")
     args = parser.parse_args()
 
-    # Common target size from DSLR's long-side -> max_side (DSLR is the no-crop reference;
-    # iPhone is resized + cropped to the same DSLR aspect ratio).
+    # common target size: the DSLR frame scaled to max_side, the iPhone frames cropped to it
     target = None
     if args.max_side:
         ref = args.scene_ids or _read_split(args.data_root / "splits" / SPLIT_FILES[args.split[0]])

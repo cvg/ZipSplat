@@ -1,9 +1,7 @@
 """Resize tar shards to a target square resolution.
 
-Reads scenes from `shard-*.tar`, resizes images + depth + cameras via
-ImagePreprocessor, and writes new shards of ~512 MB each. Images are
-re-encoded as WebP lossless; depth is re-quantized with refreshed
-log-uint8 ranges.
+Resizes the images, depth and cameras of every scene and writes new shards of ~512 MB.
+Images are re-encoded as lossless WebP, depth is re-quantized with fresh log-uint8 ranges.
 
 Usage:
     python -m splatfactory.datasets.scripts.resize \\

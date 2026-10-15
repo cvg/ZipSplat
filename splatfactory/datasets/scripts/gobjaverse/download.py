@@ -1,8 +1,7 @@
 """Download GObjaverse (G-buffer Objaverse) per-object tars from the Alibaba OSS mirror.
 
-280K Objaverse objects, 40 rendered views each (~6.5TB total, ~25MB per object).
-The mirror serves one uncompressed tar per object; tars are kept as-is (never
-extracted), convert.py reads them directly.
+280K Objaverse objects, 40 rendered views each (~6.5 TB, ~25 MB per object). The mirror serves
+one uncompressed tar per object, kept as is, and convert.py reads them directly.
 
 Object lists come from the per-category index files
 gobjaverse_280k_split/gobjaverse_280k_<category>.json (items "<dict_id>/<inst_id>").

@@ -76,10 +76,10 @@ class BaseViewSampler(ABC):
         total_num_views: int | None = None,
         scene: dict | None = None,
     ):
-        """Returns a dict with keys: context_indices, target_indices, overlap_scores.
+        """Dict of context_indices, target_indices and overlap_scores.
 
-        `scene` is the raw scene dict (tar members); samplers that need per-scene data such
-        as covisibility rankings read it from there.
+        `scene` is the raw scene dict, for samplers that read per-scene data such as the
+        covisibility rankings.
         """
         raise NotImplementedError
 

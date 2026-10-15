@@ -1,9 +1,8 @@
 """Download BlendedMVS low-res (768x576, 113 scenes) from the official GitHub release.
 
-The release ships one zip split into 16 parts (~30GB total). All parts are
-required (no per-scene sampling possible); downloads resume via curl -C -.
-After download the parts are merged into BlendedMVS_combined.zip, which
-convert.py can read directly -- or extract it for faster parallel conversion:
+The release ships one zip split into 16 parts (~30 GB). All parts are needed, and downloads
+resume (curl -C -). The parts are merged into BlendedMVS_combined.zip, which convert.py reads
+directly. Extracting it speeds up a parallel conversion:
 
     unzip -o data/blendedmvs/BlendedMVS_combined.zip -d data/blendedmvs
 

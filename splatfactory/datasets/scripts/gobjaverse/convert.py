@@ -5,25 +5,19 @@ Reads the downloaded per-object tars directly (no extraction). Raw layout:
   <inst_id>/campos_512_v4/NNNNN/NNNNN{.json,.png,_nd.exr,...}, 40 views per object
   (24-view orbit + top + bottom + 14-view orbit, all looking at the origin).
 
-Conventions applied (each verified on the data by cross-view depth reprojection):
-  - Poses: json x/y/z axes are ALREADY OpenCV (x right, y down, z forward; the
-    LGM-style loaders negate y/z to get OpenGL). c2w = [x y z | origin] ->
-    Pose.data_ [R.flatten(), t].
-  - Cameras: 512x512, f = (W/2) / tan(x_fov / 2) (full-angle fov; 0.6912 rad =
-    Blender 50mm/36mm, x_fov == y_fov). The json has NO principal point; the renders
-    are pp-centered: a cross-view depth-agreement scan over pp offsets has its
-    minimum within 0.5 px of (256, 256) on both axes (< the 1.5 px tolerance of the
-    live converts), so cx = cy = 256 exactly and no pp-centering crop/resize.
-    Camera.data_ [w, h, fx, fy, cx, cy].
-  - RGB: the PNG color is the tone-mapped PREMULTIPLIED render (edge pixels are
-    color * alpha over black), so white compositing is rgb + (255 - alpha), not
-    rgb * a + 255 * (1 - a) (that darkens silhouettes). Lossless WebP.
-  - Depth: _nd.exr alpha channel = planar z (not ray distance), also premultiplied
-    by alpha at partially covered pixels -> z = d / a where a >= 0.5, else -1
-    (background is 0). Log-uint8 WebP.
+Conventions, each checked on the data by cross-view depth reprojection:
+  - Poses: the json x / y / z axes are already OpenCV (x right, y down, z forward).
+    c2w = [x y z | origin] gives Pose.data_ [R.flatten(), t].
+  - Cameras: 512x512, f = (W / 2) / tan(x_fov / 2) with the full-angle fov (0.6912 rad,
+    x_fov == y_fov). The json has no principal point, the renders are centred, so
+    cx = cy = 256 and no centring crop is needed.
+  - RGB: the PNG color is the premultiplied render (edge pixels are color * alpha over
+    black), so white compositing is rgb + (255 - alpha). Lossless WebP.
+  - Depth: the _nd.exr alpha channel holds planar z, also premultiplied by alpha, so
+    z = d / a where a >= 0.5, else -1. Log-uint8 WebP.
 
-Splits: per-object hash of (seed, key) -> ~--test-fraction test, stable when more
-objects are downloaded later.
+Splits: a per-object hash of (seed, key) sends ~--test-fraction of the objects to test, stable
+when more objects are downloaded later.
 
 Usage:
     python -m splatfactory.datasets.scripts.gobjaverse.convert --num-workers 16

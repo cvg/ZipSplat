@@ -237,7 +237,7 @@ def write_scene_to_tar(tar: tarfile.TarFile, scene: dict):
             _tar_add(tar, f"{key}.{name}.npy", _npy_bytes(scene[name]))
 
 
-# Per-scene covisibility arrays (see the module docstring); rankings int16, scores float32.
+# Per-scene covisibility arrays (see the module docstring), rankings int16, scores float32.
 RANKING_MEMBERS = ("rankings", "overlaps", "seen_by", "sees")
 # Per-scene point tracks (see the module docstring).
 TRACK_MEMBERS = ("tracks_xyz", "tracks_vis", "tracks_seg")

@@ -1,9 +1,8 @@
 """ScanNet++ dataset configuration.
 
 Indoor scenes, converted to tar shards under `data/scannetpp_v2/<HxW>/<device>/`.
-Train pools both device captures (dslr + iphone); test is dslr only -- the
-canonical NVS split the shipped eval indices are built on (iphone has no NVS
-test split, so its test-scenes are left unused).
+Train pools both device captures (dslr and iphone). Test is the dslr NVS split,
+since the iphone captures have none.
 
 Author: Alexander Veicht
 """

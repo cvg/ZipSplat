@@ -1,10 +1,7 @@
 """Multi-view IterableDataset backed by tar shards.
 
-Streams scenes from tar shards with worker-local batching.
-Each worker independently: splits shards -> shuffles -> streams scenes ->
-samples views -> decodes -> normalizes -> collates -> yields batches.
-
-DataLoader(batch_size=None) passes batches through unchanged.
+Each worker splits the shards, shuffles, streams scenes, samples views, decodes, normalizes and
+yields whole batches, which DataLoader(batch_size=None) passes through unchanged.
 
 Author: Alexander Veicht
 """
@@ -39,23 +36,14 @@ logger = get_logger(__name__)
 
 
 def resolve_shard_paths(shard_dirs, shard_glob: str = "shard-*.tar") -> list[Path]:
-    """Glob shard files from one directory or several (sorted, deduped).
-
-    `shard_dirs` accepts a str/Path or a list of them (an OmegaConf ListConfig is
-    fine), letting a dataset pool shards from multiple directories -- e.g.
-    ScanNet++ combining its dslr and iphone train shards.
-    """
+    """Sorted, deduplicated shard files of one directory or a list of them."""
     if isinstance(shard_dirs, (str, Path)):
         shard_dirs = [shard_dirs]
     return sorted({p for d in shard_dirs for p in Path(str(d)).glob(shard_glob)})
 
 
 class MultiViewDataset(BaseDataset, IterableDataset):
-    """Multi-view dataset that streams scenes from tar shards.
-
-    Each DataLoader worker independently splits shards, samples view counts,
-    assembles complete batches, and yields them via DataLoader(batch_size=None).
-    """
+    """Multi-view dataset that streams scenes from tar shards in worker-local batches."""
 
     base_default_conf = {
         "name": "???",
@@ -73,24 +61,21 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         "augmentations": {"name": "identity"},
         "preprocessing": {},
         "use_relative_poses": True,
-        # "first_cam" | "mean_cam" (TokenGS avg-pose frame) | "mean_cam_down" (mean_cam with the
-        # DOWN axis primary + confidence-gated azimuth pin -- immune to the loop/orbit forward
-        # degeneracy and the OOD pitch tilt, see geometry/utils/scale.py:mean_cam_down_transform)
-        # | "mean_point" (view-0 rotation, origin = robust median of context depth points --
-        # centers the scene, not the cameras)
-        # | "mean_point_const" (mean_point but a CONSTANT +1-normalized-unit forward origin shift
-        # along the view-0 optical axis -- depth-free, deterministic; pair with head z-bias 0).
-        "reference_frame": "first_cam",  # the ZipSplat training frame
-        "normalize_baseline": False,
-        "scene_scale_constant": None,  # if set, inv_scale = this constant (skips compute_scene_scale)
-        # near/far are constants in the NORMALIZED frame (units of the scene scale, i.e.
-        # median depth = 1 under the default normalization; raw units iff the scale
-        # normalization is off, e.g. normalize_baseline: none). They are NOT divided by
-        # the per-scene scale -- doing so injected the arbitrary raw gauge (SfM/DA3
-        # units), making them swing ~6.5x scene-to-scene (bug, fixed 2026-07-09).
+        # Frame of the poses:
+        #   first_cam: the first context view (the ZipSplat training frame)
+        #   mean_cam: the average context camera
+        #   mean_cam_down: the average camera with the mean down axis primary
+        #   mean_point: first-view rotation, origin at the median context depth point
+        #   mean_point_const: first-view rotation, origin shifted one unit along its axis
+        "reference_frame": "first_cam",
+        "normalize_baseline": False,  # scene scale, see geometry/utils/scale.py
+        "scene_scale_constant": None,  # fixed scene scale instead of the computed one
+        # near / far in the normalized frame, not divided by the per-scene scale
         "near": 0.01,
         "far": 1000.0,
-        "max_pose_jump_ratio": 10.0,  # 0 disables; otherwise skip if max/median consecutive step > ratio
+        # skip a scene whose largest consecutive camera step exceeds this times the median
+        # one, 0 disables
+        "max_pose_jump_ratio": 10.0,
         "train_batch_size": "???",
         "val_batch_size": 1,
         "test_batch_size": 1,
@@ -169,7 +154,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         return self.conf.get(self.split + "_batch_size", self.conf.batch_size)
 
     def __len__(self) -> int:
-        """Approximate length. Eval: valid scenes from index; train: shard count."""
+        """Approximate length: the valid scenes of the eval indices, else the shard count."""
         if hasattr(self.view_sampler, "valid_scenes"):
             n = len(self.view_sampler.valid_scenes)
             if self.conf.max_samples is not None:
@@ -245,12 +230,10 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         dataset_name: str | None = None,
         max_pose_jump_ratio: float | None = None,
     ) -> dict:
-        """Process a raw scene dict into a training sample.
+        """Sample views of a raw scene, decode them and normalize their frame and scale.
 
-        view sampling -> decode -> pose normalization -> scale normalization -> near/far.
-
-        ComposedDataset passes child-specific view_sampler/preprocessor/dataset_name/
-        max_pose_jump_ratio; single-dataset callers let them default to self.*.
+        ComposedDataset passes its child's sampler, preprocessor, name and jump ratio, which
+        otherwise default to this dataset's own.
         """
         if view_sampler is None:
             view_sampler = self.view_sampler
@@ -307,15 +290,10 @@ class MultiViewDataset(BaseDataset, IterableDataset):
             if self.conf.reference_frame == "mean_cam":
                 ref = Pose.from_4x4mat(mean_cam_transform(context["pose"].Rt))
             elif self.conf.reference_frame == "mean_cam_down":
-                # anchor = context SLOT 0, the same view first_cam references. It must be a slot
-                # the model can point at, not a property of the capture: random_reference_view
-                # shuffles the context order above, so a temporally-defined anchor is invisible
-                # to the model and leaves the azimuth guessable only up to which end of the
-                # trajectory came first (measured: 17 deg median / 119 deg p90 on dl3dv 24v).
+                # heading anchor: context slot 0, as for first_cam, which the model can observe
                 ref = Pose.from_4x4mat(mean_cam_down_transform(context["pose"].Rt))
             elif self.conf.reference_frame == "mean_point":
-                # view-0 rotation (identity), origin shifted to the robust point centroid:
-                # single-knob vs first_cam (only the translation origin moves).
+                # first_cam with the origin moved to the median context depth point
                 ref = context["pose"][0].inv()
                 centroid = context_point_centroid(
                     context["pose"], context["camera"], context["depth"], context["depth_mask"]
@@ -323,8 +301,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
                 if centroid is not None:
                     ref = Pose.from_Rt(ref.R, -(ref.R @ centroid))
             elif self.conf.reference_frame == "mean_point_const":
-                # view-0 rotation (identity); the CONSTANT forward origin shift is applied AFTER
-                # scale normalization (below) so it is a fixed 1 normalized unit, depth-free.
+                # first_cam here, the origin shift follows the scale normalization below
                 ref = context["pose"][0].inv()
             else:
                 ref = context["pose"][0].inv()
@@ -351,10 +328,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
 
         shift = None
         if self.conf.use_relative_poses and self.conf.reference_frame == "mean_point_const":
-            # Constant, depth-free approximation of mean_point: move the world origin +1
-            # normalized unit forward along the view-0 optical axis (view-0 is identity in this
-            # frame -> forward = +z). Places the scene ~at the origin with view-0 one unit behind,
-            # without mean_point's per-scene depth-median noise. Pairs with head init z-bias 0.
+            # move the origin one normalized unit along the first view's optical axis (+z)
             t = context["pose"].t
             shift = Pose.from_Rt(
                 torch.eye(3, dtype=t.dtype, device=t.device), t.new_tensor([0.0, 0.0, -1.0])

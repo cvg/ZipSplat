@@ -1,26 +1,22 @@
 """Convert WildRGB-D videos to canonical tar shards.
 
-Raw layout (read directly from <data-root>/<category>.zip, no extraction; split
-archives must be merged by download.py first):
+Raw layout, read directly from <data-root>/<category>.zip (split archives are merged by
+download.py first):
   <category>/{camera_eval_list,nvs_list,types}.json
   <category>/scenes/scene_XXX/
       rgb/NNNNN.png      480x640 (WxH, portrait) RGB PNG, 30 fps iPhone video
       depth/NNNNN.png    uint16 depth in mm, same resolution, 0 = invalid
       masks/NNNNN.png    object masks (not stored)
-      metadata           JSON {fps, w, h, K}; K is stored column-major (K^T)
+      metadata           JSON {fps, w, h, K}, K stored column-major
       cam_poses.txt      rows "frame_id + 16 floats": c2w 4x4 row-major, OpenCV
 
-Conventions applied (matching DUSt3R's preprocess_wildrgbd.py and the
-arkitscenes/co3d converts):
-  - Frames subsampled to --num-frames evenly spaced indices (linspace, as DUSt3R;
-    0 keeps all).
-  - Principal point centered per scene (crop_to_principal_point ->
-    resize_to_cover -> crop_to_ar) back to exactly 640x480 (HxW); intrinsics
-    composed through every transform.
+Conventions, as in DUSt3R's preprocess_wildrgbd.py:
+  - Frames subsampled to --num-frames evenly spaced indices, 0 keeps all.
+  - Principal point centred per scene (crop_to_principal_point, resize_to_cover,
+    crop_to_ar) back to exactly 640x480 (HxW).
   - Poses: OpenCV c2w Pose.data_ [R.flatten(), t].
-  - RGB re-encoded lossless WebP (source is PNG and resampled -> no passthrough).
-  - Depth mm -> m, full frame (not masked to the object), same geometry,
-    log-uint8 WebP.
+  - RGB re-encoded as lossless WebP, since the PNG source is resampled.
+  - Depth from mm to m, full frame (not masked to the object), log-uint8 WebP.
   - meta.json carries the category and the official video type (single / multi /
     hand) from types.json.
 

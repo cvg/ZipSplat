@@ -1,11 +1,8 @@
-"""Composed dataset - combines multiple datasets with weighted sampling.
+"""Composed dataset: several datasets mixed by weight.
 
-Inherits from MultiViewDataset. Pools shards from all children, oversamples smaller
-datasets so effective scene counts match configured weight ratios. Each shard is
-tagged with its source child, and per-child view_sampler/preprocessor/dataset_name/
-max_pose_jump_ratio are passed explicitly to the parent's scene processing.
-
-Adding a new dataset requires only a config change.
+Pools the shards of all children and oversamples the smaller ones so the scene draws match the
+configured weights. Each child keeps its own view sampler, preprocessing and aspect ratios.
+Adding a dataset to the mix is a config change.
 
 Author: Alexander Veicht
 """
@@ -46,11 +43,7 @@ class _ChildSource:
 
 
 class ComposedDataset(MultiViewDataset):
-    """Shard dataset combining multiple shard sources with weighted sampling.
-
-    Each tagged shard carries its child index; the child's view_sampler and
-    preprocessor are passed to the parent's _process_scene per scene.
-    """
+    """Shard dataset combining several children with weighted sampling."""
 
     base_default_conf = {
         **MultiViewDataset.base_default_conf,
@@ -115,10 +108,7 @@ class ComposedDataset(MultiViewDataset):
 
     @staticmethod
     def _count_scenes(shard_dirs) -> int:
-        """Count scenes from index.json (fast) or by scanning tars (slow fallback).
-
-        Accepts one directory or several (str/Path/list); sums the counts.
-        """
+        """Scenes in one or several shard directories, from index.json or by scanning tars."""
         if isinstance(shard_dirs, (str, Path)):
             shard_dirs = [shard_dirs]
         total = 0
@@ -248,7 +238,7 @@ class ComposedDataset(MultiViewDataset):
             if not batch:
                 if pending is None:
                     break  # stream exhausted
-                continue  # every scene of this child was skipped; start on the pending one
+                continue  # every scene of this child was skipped, start on the pending one
 
             yield workers.collate(batch)
             yielded += len(batch)

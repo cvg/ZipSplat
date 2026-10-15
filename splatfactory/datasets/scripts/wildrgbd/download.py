@@ -1,11 +1,10 @@
 """Download WildRGB-D category zips from the official HuggingFace release.
 
-The release (huggingface.co/hongchi/wildrgbd, ~3.7TB, 46 categories) ships one zip per
-category; large categories are Info-ZIP split archives (<cat>.z01, <cat>.z02, ...,
-<cat>.zip). Zips are kept compressed; convert.py reads them directly. Split parts land
-in <output-dir>/parts/ and are merged (`zip -s 0`) into <output-dir>/<cat>.zip, after
-which the parts are removed. A category is done once <output-dir>/<cat>.zip exists, so
-reruns resume; interrupted files resume byte-wise (curl -C -).
+The release (huggingface.co/hongchi/wildrgbd, ~3.7 TB, 46 categories) ships one zip per
+category, large ones as split archives (<cat>.z01, <cat>.z02, ..., <cat>.zip). The parts are
+merged (`zip -s 0`) into <output-dir>/<cat>.zip and removed. Zips stay compressed, convert.py
+reads them directly. A category with a finished zip is skipped, so reruns resume, and
+interrupted files resume where they stopped.
 
 Sampling: --categories picks categories by name, --max-categories the first N
 (alphabetical) of the selection.
@@ -56,8 +55,8 @@ def download_file(item: tuple[str, int, Path]) -> DownloadResult:
     tmp = path.with_suffix(path.suffix + ".tmp")
     ret = 0
     if not (tmp.exists() and tmp.stat().st_size == size):
-        # http1.1: HF's HTTP/2 streams get cancelled mid-file (curl 92); speed-*: abort
-        # a stalled connection instead of hanging forever; retry covers both.
+        # HTTP/1.1 since Hugging Face cancels HTTP/2 streams mid-file, and the speed limits
+        # abort a stalled connection, both retried
         cmd = ["curl", "-sSL", "--fail", "-C", "-", "--connect-timeout", "30", *CURL_ROBUST]
         ret = subprocess.call(cmd + [f"{FILE_URL}/{name}", "--output", str(tmp)])
     if ret != 0 or not tmp.exists() or tmp.stat().st_size != size:

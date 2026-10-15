@@ -1,24 +1,16 @@
 """Precompute per-view covisibility rankings for the `rank` view sampler (tar shards).
 
-For every scene, every ordered pair of views is scored by depth covisibility: a
---grid x --grid sample of the source view's GT depth is unprojected, projected into
-the target view and counted when it lands inside the image, in front of the camera,
-and within --tol (relative) of the target's full-resolution depth (occlusion-aware).
-Views are ranked by mutual covisibility (the smaller of the two directions). The result is
-written into each scene IN PLACE (shard rewrite via .tmp + atomic rename, as extract_depth.py)
-as four tar members right after the scene's meta.json, the format `view_sampler/rank.py` reads:
+Every ordered pair of views is scored by depth covisibility: a --grid x --grid sample of the
+source view's depth is projected into the target view and counts when it lands in the image,
+in front of the camera and within --tol (relative) of the target's depth. Views are ranked by
+the smaller of the two directions. The result is written into each scene in place, as four tar
+members after its meta.json, in the format `view_sampler/rank.py` reads:
     {key}.rankings.npy  (N, k) int16    k most covisible views per view, self first
     {key}.overlaps.npy  (N, k) float32  min of both directions
     {key}.seen_by.npy   (N, k) float32  fraction of the reference's pixels seen by the view
     {key}.sees.npy      (N, k) float32  fraction of the view's pixels seen by the reference
-Both directions are stored so a different score never needs a recompute. Pose distance is
-not used anywhere: in room scans the camera turns in place, so pose-nearest views often
-share nothing. Scenes that already carry the members are skipped, so a rerun is a no-op.
-
-Only the depth / camera / pose members of each tar are read (image bytes are
-skipped). All pairs are scored on the GPU; a 1,400-view scene takes a few seconds.
-`--from-json` packs a rankings.json produced by the earlier version of this script into
-the shards without re-scoring (no GPU needed).
+Scenes that already carry the members are skipped, so a rerun is a no-op. Only the depth,
+camera and pose members are read, and the pairs are scored on the GPU.
 
 Usage:
     python -m splatfactory.datasets.scripts.precompute_rankings \

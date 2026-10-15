@@ -2,8 +2,8 @@
 
 Indoor iPhone video scans with LiDAR depth, converted to tar shards under
 `data/arkitscenes/<HxW>/`. Videos are rotated upright at convert time, so landscape
-captures live in `480x640` and portrait ones in `640x480`; train pools both trees.
-Splits follow the official Training / Validation lists.
+captures live in `480x640` and portrait ones in `640x480`. Both splits pool the two
+trees and follow the official Training / Validation lists.
 
 Author: Alexander Veicht
 """

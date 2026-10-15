@@ -274,24 +274,20 @@ def write_shards(
 ) -> dict[str, str]:
     """Write scene dicts to tar shards with size-based rotation and atomic commits.
 
-    Each shard is written to ``shard-NNNNNN.tar.tmp`` and atomically renamed to its
-    final name on close (same pattern as ``repack.py``), so a committed shard is
-    always complete; ``index.json`` is flushed after each commit and therefore only
-    ever references whole shards. A crash leaves at most one stale ``.tmp``.
+    Each shard is written to ``shard-NNNNNN.tar.tmp`` and renamed on close, so committed
+    shards are always complete, and ``index.json`` only lists committed shards.
 
     Args:
-        scenes: iterable of scene dicts (matching io.write_scene_to_tar format).
-        output_dir: directory for shard-NNNNNN.tar files + index.json.
-        shard_size_mb: approximate max size per shard in MB.
-        desc: progress bar description.
-        total: expected scene count (enables %/ETA and a projected total size).
-        resume: keep already-committed shards (from index.json), continue shard
-            numbering, and skip their scenes. Shard-level: scenes in the dropped
-            partial shard are reprocessed. Caller should pre-filter committed keys
-            to avoid recomputing them.
+        scenes: Scene dicts in the io.write_scene_to_tar format.
+        output_dir: Directory of the shards and index.json.
+        shard_size_mb: Approximate shard size in MB.
+        desc: Progress bar description.
+        total: Expected scene count, for the progress and the projected size.
+        resume: Keep the committed shards, continue their numbering and skip their scenes.
+            Scenes of a partial shard are processed again.
 
     Returns:
-        index: dict mapping scene key -> shard filename.
+        The scene key to shard file name mapping.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -395,21 +391,18 @@ def parallel_map(
     skip_label: Callable = repr,
     stats: dict | None = None,
 ) -> Iterator:
-    """Apply fn to items, yielding results as they complete.
+    """Apply fn to items in a process pool, yielding results as they complete.
 
-    Sequential if num_workers == 0; otherwise uses a ProcessPoolExecutor with a
-    bounded in-flight window (max_pending items submitted at once). Exceptions
-    are logged via tqdm.write and the item is skipped.
+    Items whose fn raises are logged and skipped.
 
     Args:
-        fn: callable taking one item, returning one result (or raising).
-        items: iterable of items.
-        num_workers: 0 = sequential, >0 = process pool workers.
-        max_pending: max in-flight futures (default: 2 * num_workers).
-        skip_label: function(item) -> str for the skip message.
-        stats: if given, updated with {"max": window, "ready": completed-but-not-yet-
-            consumed results}. ready near max -> consumer is the bottleneck (IO/write);
-            ready near 0 -> producers are the bottleneck (compute).
+        fn: Function of one item.
+        items: The items.
+        num_workers: Pool size, 0 runs sequentially.
+        max_pending: Cap on items in flight. Default: 2 * num_workers.
+        skip_label: Label of an item in the skip message.
+        stats: Optional dict, kept updated with the window size ("max") and the finished
+            results not yet consumed ("ready").
     """
     if num_workers == 0:
         for item in items:

@@ -22,7 +22,7 @@ class MipNeRF360(MultiViewDataset):
         "aspect_ratios": [1.0],
         "num_target_views": 8,
         "random_reference_view": False,
-        # View sampler - eval uses external indices via eval_sampler; default bounded is a sane fallback.
+        # the benchmarks replace it with the eval_sampler and fixed indices
         "view_sampler": {"name": "bounded", "warm_up_steps": 0},
         "max_pose_jump_ratio": 0,  # static scenes - not a video
         # Normalization

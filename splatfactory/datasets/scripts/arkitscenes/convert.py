@@ -6,21 +6,18 @@ Raw layout (`<root>/{Training,Validation}/<video_id>/`, assets zipped or extract
   - lowres_depth[.zip]: 256x192 uint16 PNG LiDAR depth in mm
   - lowres_wide.traj: rows "ts ax ay az tx ty tz" -- world-to-camera axis-angle
 
-Conventions applied (matching scannetpp/blendedmvs converts):
-  - Per-frame pose interpolated from the ~10Hz trajectory (position lerp +
-    rotation slerp; frames outside the trajectory or across >0.3s gaps are
-    skipped), sorted by timestamp, subsampled by --subsample (default 10 ->
-    ~3 fps keyframes from the 30 fps stream).
-  - Frames rotated upright per video from Apple's metadata.csv `sky_direction`
-    (vga_wide keeps the sensor frame; 68% of videos are stored sideways or
-    inverted). Up/Down videos -> <output>/480x640, Left/Right videos ->
-    <output>/640x480 (portrait); intrinsics and camera frame rotated along.
-  - Principal point centered per frame (crop_to_principal_point ->
-    resize_to_cover -> crop_to_ar) to exactly the tree's shape.
+Conventions:
+  - Per-frame poses interpolated from the ~10 Hz trajectory (position lerp, rotation slerp).
+    Frames outside the trajectory or across gaps over 0.3 s are skipped, the rest subsampled
+    by --subsample (default 10, ~3 fps from the 30 fps stream).
+  - Frames rotated upright per video from Apple's metadata.csv `sky_direction`, since
+    vga_wide keeps the sensor frame. Up / Down videos go to <output>/480x640, Left / Right
+    videos to <output>/640x480 (portrait), with intrinsics and camera frame rotated along.
+  - Principal point centred per frame (crop_to_principal_point, resize_to_cover,
+    crop_to_ar) to exactly the tree's shape.
   - Poses stored as OpenCV c2w Pose.data_ [R.flatten(), t].
-  - RGB re-encoded lossless WebP (source is PNG; resampled -> no passthrough).
-  - Depth mm -> m, upscaled to RGB res (INTER_LINEAR, NaN-marked), same
-    geometry, log-uint8 WebP.
+  - RGB re-encoded as lossless WebP, since the PNG source is resampled.
+  - Depth from mm to m, upscaled to the RGB size (INTER_LINEAR, NaN-marked), log-uint8 WebP.
 
 Splits: Training -> train, Validation -> test.
 
@@ -61,10 +58,9 @@ logger = get_logger(__name__)
 
 MAX_TRAJ_GAP = 0.3  # skip frames whose bracketing trajectory entries are further apart (s)
 
-# vga_wide keeps the sensor frame whatever way the iPad was held, so 68% of the videos are
-# stored sideways or upside down (Apple's raw/metadata.csv `sky_direction`: Up 1607, Left
-# 2334, Down 1125, Right 1, NA 4 of 5071). Frames are rotated upright per video, as
-# DUSt3R/MASt3R do; Left/Right videos become portrait 640x480 and get their own tree.
+# vga_wide keeps the sensor frame whatever way the iPad was held, so most videos are stored
+# sideways or upside down (Apple's metadata.csv `sky_direction`). Frames are rotated upright
+# per video, as in DUSt3R. Left / Right videos become portrait 640x480 in their own tree.
 ROT_K = {"Up": 0, "Right": 1, "Down": 2, "Left": 3}  # np.rot90 quarter turns (CCW)
 TARGETS = {0: (480, 640), 1: (640, 480), 2: (480, 640), 3: (640, 480)}  # (out_h, out_w)
 # Camera-frame rotation matching np.rot90(img, k): columns = new axes in old camera coords.

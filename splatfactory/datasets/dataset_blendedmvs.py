@@ -2,8 +2,8 @@
 
 Unordered MVS captures (objects, buildings, aerial), converted to tar shards
 under `data/blendedmvs/576x768/`. Train holds the 106 scenes of the official
-list; test holds the 7 scenes of `validation_list.txt`, which the shipped eval
-indices are built on. Depth comes from the dataset's mesh-rendered depth maps.
+list, test the 7 scenes of `validation_list.txt`. Depth comes from the dataset's
+mesh-rendered depth maps.
 
 Author: Alexander Veicht
 """
