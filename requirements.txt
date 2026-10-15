@@ -1,4 +1,5 @@
 torch
+triton
 numpy<2
 einops
 tqdm
