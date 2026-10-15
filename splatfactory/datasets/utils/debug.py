@@ -14,6 +14,7 @@ from einops import rearrange
 from tqdm import tqdm
 
 from splatfactory.utils import mappings
+from splatfactory.visualization import viz2d, viz3d
 
 # --- Debug runner -------------------------------------------------------------
 
@@ -137,8 +138,6 @@ def _t2img(t: torch.Tensor) -> torch.Tensor:
 
 def visualize_data_batch(batch: dict, port: int = 8097) -> None:
     """Visualize a raw data batch with 3D point cloud and image/depth grid."""
-    from splatfactory.visualization import viz2d, viz3d
-
     mappings.print_summary(batch)
 
     # --- 3D point cloud ---

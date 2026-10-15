@@ -19,7 +19,7 @@ class MipNeRF360(MultiViewDataset):
         "shard_glob": "*.tar",  # one tar per scene, not `shard-*.tar`
         # Views
         "image_num_range": [6, 6],
-        "aspect_ratio_range": [1.0, 1.0],
+        "aspect_ratios": [1.0],
         "num_target_views": 8,
         "random_reference_view": False,
         # View sampler - eval uses external indices via eval_sampler; default bounded is a sane fallback.

@@ -100,7 +100,7 @@ gaussians = model([load_image("photo.jpg")])["gaussians"]
 # a video clip (evenly samples num_frames across the clip)
 gaussians = model(load_video("assets/examples/drone.mp4", num_frames=24))["gaussians"]
 ```
-The model handles 1-24+ views; more views give wider coverage, fewer give a tighter reconstruction.
+The model handles 1-24+ views. More views give wider coverage, fewer give a tighter reconstruction.
 </details>
 
 <details>
@@ -210,86 +210,13 @@ already rendered from the geometry (chamfer) loss, so that term only supervises 
 images don't already constrain. Inference works with stock gsplat. This fork only matters for
 training.
 
-<details>
-<summary><b>Preparing the data</b></summary>
+### Data
 
-Every dataset is converted into a common format: uncompressed tar shards of scenes (images,
-cameras, poses, and optional depth) written under `data/<dataset>/<HxW>/{train,test}-scenes/`. The
-shipped configs point `data.dataset_dir` at these paths, so the default commands below produce
-exactly what training and evaluation expect. Each dataset has a `download` step (fetch the raw data)
-and a `convert` step (pack it into shards). Add `--num-workers N` to parallelize either. **For
-evaluation you only need the test split**, so pass `--split test` to `convert` where available.
-
-<details>
-<summary><b>RE10K</b></summary>
-
-A single archive (pixelSplat/MVSplat format) packed into shards at 360x640:
-
-```bash
-# download -> data/re10k/raw/re10k.zip
-python -m splatfactory.datasets.scripts.re10k.download
-# convert -> data/re10k/360x640/{train,test}-scenes
-python -m splatfactory.datasets.scripts.re10k.convert --num-workers 8
-# evaluation only: just the test split
-python -m splatfactory.datasets.scripts.re10k.convert --split test
-```
-</details>
-
-<details>
-<summary><b>DL3DV</b></summary>
-
-Gated on Hugging Face, so accept the dataset terms and run `huggingface-cli login` first. We use the
-960P release (540x960). Redistribution is not permitted, so the script pulls directly from Hugging Face
-per the DL3DV terms.
-
-```bash
-# download -> data/dl3dv/raw/960P/<batch>/<hash>.zip  (one zip per scene)
-python -m splatfactory.datasets.scripts.dl3dv.download --resolution 960P --num-workers 4
-# convert -> data/dl3dv/540x960/{train,test}-scenes
-python -m splatfactory.datasets.scripts.dl3dv.convert --resolution 960P --num-workers 8
-# evaluation only: just the test split
-python -m splatfactory.datasets.scripts.dl3dv.convert --resolution 960P --split test
-```
-</details>
-
-<details>
-<summary><b>MipNeRF360</b> (evaluation only)</summary>
-
-A single ~3.6 GB archive, converted from COLMAP poses into one shard per scene at 822x1236 (the 7
-public scenes). The whole dataset is an evaluation set, so there is no train/test split to select.
-
-```bash
-# download -> data/mipnerf360/raw/360_v2.zip
-python -m splatfactory.datasets.scripts.mipnerf360.download
-# convert -> data/mipnerf360/822x1236/test-scenes
-python -m splatfactory.datasets.scripts.mipnerf360.convert
-```
-</details>
-
-Two optional post-processing tools operate on any shard directory:
-[`repack`](splatfactory/datasets/scripts/repack.py) re-buckets shards to a uniform size, and
-[`resize`](splatfactory/datasets/scripts/resize.py) writes a fixed-resolution copy (e.g. `--size
-252`) to a new directory.
-
-**Depth.** Every dataset needs per-view depth maps, for both training and evaluation: training uses them for
-the depth and chamfer loss, and the data pipeline uses them to normalize each scene's scale. The
-shards from `convert` carry images and poses but no depth. Add it in place with
-the [`extract_depth`](splatfactory/datasets/scripts/extract_depth.py) script, which runs DA3 on each
-scene (needs a GPU and the `depth-anything-3` package). Run it on every shard directory you train or
-evaluate on:
-
-```bash
-python -m splatfactory.datasets.scripts.extract_depth data/re10k/360x640/train-scenes
-python -m splatfactory.datasets.scripts.extract_depth data/re10k/360x640/test-scenes
-python -m splatfactory.datasets.scripts.extract_depth data/dl3dv/540x960/train-scenes
-python -m splatfactory.datasets.scripts.extract_depth data/dl3dv/540x960/test-scenes
-python -m splatfactory.datasets.scripts.extract_depth data/mipnerf360/822x1236/test-scenes
-```
-
-It can be parallelized across GPUs with torchrun:
-`torchrun --nproc_per_node=4 -m splatfactory.datasets.scripts.extract_depth <shard-dir>`.
-
-</details>
+Every dataset is converted into the same format, tar shards of scenes under
+`data/<dataset>/<HxW>/{train,test}-scenes/`, with one `download` and one `convert` script per
+dataset and DA3 depth added by `extract_depth` where the source has none. The commands for every
+dataset are in [`splatfactory/datasets/README.md`](splatfactory/datasets/README.md). Evaluation
+needs only the test splits.
 
 ## Evaluation
 
