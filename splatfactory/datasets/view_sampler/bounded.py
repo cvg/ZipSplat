@@ -58,7 +58,7 @@ class BoundedViewSampler(BaseViewSampler):
         assert (
             max_gap >= min_gap
         ), f"Example does not have enough frames! {max_gap=}, {min_gap=} ({num_views=})"
-        context_gap = np.random.randint(min_gap, max_gap + 1)
+        context_gap = self.draw_gap(min_gap, max_gap)
 
         left = np.random.randint(
             num_views if self.cameras_are_circular else num_views - context_gap
@@ -120,6 +120,7 @@ class BoundedViewSampler(BaseViewSampler):
         num_context_views: int | None = None,
         num_target_views: int | None = None,
         total_num_views: int | None = None,
+        scene: dict | None = None,
     ):
         """Returns a dict with keys: context_indices, target_indices, overlap_scores"""
         assert num_context_views >= 1, "At least one context view is required!"

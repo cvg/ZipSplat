@@ -43,10 +43,11 @@ def parse_eval_args(benchmark, args, configs_path, default=None):
     conf = OmegaConf.merge(conf, cli_conf)
     conf.checkpoint = args.checkpoint if args.checkpoint else conf.get("checkpoint")
 
-    # Track if max_samples explicitly set before checkpoint merge
-    explicit_max_samples = "max_samples" in conf or any(
-        "max_samples" in arg for arg in args.dotlist
-    )
+    # Only a CLI override counts as a deliberate truncation. A stray `max_samples` left in
+    # a --conf file otherwise silently shortens a full eval, which is how eval_tokengs_6v
+    # carried `max_samples: 5` into paper rows. (Reading it off `conf` here cannot work:
+    # conf already holds the yaml, so a config value would always mark itself explicit.)
+    explicit_max_samples = any(arg.split("=")[0].strip() == "max_samples" for arg in args.dotlist)
 
     checkpoint_name = conf.checkpoint
     if conf.checkpoint and not conf.checkpoint.endswith(".tar"):
@@ -135,7 +136,8 @@ def run_cli(eval_cls, name: str, parser: argparse.ArgumentParser | None = None):
     if num_views is not None:
         if num_views not in indices:
             raise ValueError(
-                f"eval.num_views={num_views} not available for {name}; choose from {sorted(indices)}"
+                f"eval.num_views={num_views} not available for {name}, choose from "
+                f"{sorted(indices)}"
             )
         OmegaConf.update(conf, "data.view_sampler.indices_file", indices[num_views])
 

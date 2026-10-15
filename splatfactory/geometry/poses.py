@@ -10,9 +10,20 @@ from typing import NamedTuple, Tuple, Union
 import numpy as np
 import torch
 
-from splatfactory.geometry.utils import so3exp_map
 from splatfactory.utils.conversions import rad2deg, rotmat2rad, skew_symmetric
 from splatfactory.utils.tensor import TensorWrapper, autocast
+
+
+def so3exp_map(w, eps: float = 1e-7):
+    """Rotation matrices [..., 3, 3] of axis-angle vectors [..., 3]."""
+    theta = w.norm(p=2, dim=-1, keepdim=True)
+    small = theta < eps
+    div = torch.where(small, torch.ones_like(theta), theta)
+    W = skew_symmetric(w / div)
+    theta = theta[..., None]  # ... x 1 x 1
+    res = W * torch.sin(theta) + (W @ W) * (1 - torch.cos(theta))
+    res = torch.where(small[..., None], W, res)  # first-order Taylor approx
+    return torch.eye(3).to(W) + res
 
 
 class Pose(TensorWrapper):
@@ -32,13 +43,7 @@ class Pose(TensorWrapper):
     @classmethod
     @autocast
     def from_Rt(cls, R: torch.Tensor, t: torch.Tensor) -> "Pose":
-        """Pose from a rotation matrix and translation vector.
-        Accepts numpy arrays or PyTorch tensors.
-
-        Args:
-            R: rotation matrix with shape (..., 3, 3).
-            t: translation vector with shape (..., 3).
-        """
+        """Pose from rotations [..., 3, 3] and translations [..., 3], numpy or torch."""
         assert R.shape[-2:] == (3, 3)
         assert t.shape[-1] == 3
         assert R.shape[:-2] == t.shape[:-1]
@@ -48,13 +53,7 @@ class Pose(TensorWrapper):
     @classmethod
     @autocast
     def from_aa(cls, aa: torch.Tensor, t: torch.Tensor) -> "Pose":
-        """Pose from an axis-angle rotation vector and translation vector.
-        Accepts numpy arrays or PyTorch tensors.
-
-        Args:
-            aa: axis-angle rotation vector with shape (..., 3).
-            t: translation vector with shape (..., 3).
-        """
+        """Pose from axis-angle rotations [..., 3] and translations [..., 3], numpy or torch."""
         assert aa.shape[-1] == 3
         assert t.shape[-1] == 3
         assert aa.shape[:-1] == t.shape[:-1]
@@ -62,10 +61,7 @@ class Pose(TensorWrapper):
 
     @classmethod
     def from_4x4mat(cls, T: torch.Tensor) -> "Pose":
-        """Pose from an SE(3) transformation matrix.
-        Args:
-            T: transformation matrix with shape (..., 4, 4).
-        """
+        """Pose from SE(3) matrices [..., 4, 4]."""
         assert T.shape[-2:] == (4, 4)
         R, t = T[..., :3, :3], T[..., :3, 3]
         return cls.from_Rt(R, t)
@@ -114,12 +110,8 @@ class Pose(TensorWrapper):
 
     @autocast
     def transform(self, p3d: torch.Tensor) -> torch.Tensor:
-        """Transform a set of 3D points.
-        Args:
-            p3d: 3D points, numpy array or PyTorch tensor with shape (..., 3).
-        """
+        """Transform 3D points [..., 3], numpy or torch."""
         assert p3d.shape[-1] == 3
-        # assert p3d.shape[:-2] == self.shape  # allow broadcasting
         return p3d @ self.R.transpose(-1, -2) + self.t.unsqueeze(-2)
 
     def __mul__(self, p3D: torch.Tensor) -> torch.Tensor:
@@ -127,8 +119,7 @@ class Pose(TensorWrapper):
         return self.transform(p3D)
 
     def __matmul__(self, other: Union["Pose", torch.Tensor]) -> Union["Pose", torch.Tensor]:
-        """Transform a set of 3D points: T_A2B * p3D_A -> p3D_B.
-        or chain two SE(3) poses: T_B2C @ T_A2B -> T_A2C."""
+        """Transform points (T_A2B @ p3D_A -> p3D_B) or chain poses (T_B2C @ T_A2B -> T_A2C)."""
         if isinstance(other, self.__class__):
             return self.compose(other)
         else:
@@ -145,11 +136,7 @@ class Pose(TensorWrapper):
         return J  # N x 3 x 6
 
     def magnitude(self) -> Tuple[torch.Tensor]:
-        """Magnitude of the SE(3) transformation.
-        Returns:
-            dr: rotation angle in degrees.
-            dt: translation distance in meters.
-        """
+        """Rotation angle in degrees and translation distance of the transformation."""
         trace = torch.diagonal(self.R, dim1=-1, dim2=-2).sum(-1)
         cos = torch.clamp((trace - 1) / 2, -1, 1)
         dr = torch.acos(cos).abs() / math.pi * 180

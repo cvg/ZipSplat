@@ -6,5 +6,4 @@ qknorm_start: 8
 rope_start: 8
 cat_token: true
 with_camera_enc: true
-freeze_camera_enc: true
-weights: weights/da3-large.pth
+weights: weights/da3/da3-large.pth

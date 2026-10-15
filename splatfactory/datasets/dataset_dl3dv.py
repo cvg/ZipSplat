@@ -15,7 +15,7 @@ class DL3DV(MultiViewDataset):
         "test_shard_dir": "${.dataset_dir}/test-scenes",
         # Views
         "image_num_range": [2, 2],
-        "aspect_ratio_range": [1.0, 1.0],
+        "aspect_ratios": [1.0],
         "num_target_views": 4,
         "random_reference_view": True,
         # View sampler (DL3DV has shorter sequences than RE10K)

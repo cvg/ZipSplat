@@ -1,12 +1,31 @@
 """Scene I/O for tar shard storage.
 
 Tar shard format (one scene = group of files sharing a key prefix):
-    {key}.meta.json          # {"num_views": N, "has_depth": bool}
+    {key}.meta.json          # {"num_views": N, "has_depth": bool, ...meta_extra}
     {key}.cameras.npy        # (N, D) float32 - Camera.data_
     {key}.poses.npy          # (N, 12) float32 - Pose.data_ (c2w)
     {key}.img{i}.{ext}       # image bytes (JPEG/PNG/WebP passthrough)
     {key}.dep{i}.webp        # log-uint8 depth, WebP lossless (optional)
     {key}.depth_ranges.json  # [[d_min, d_max], ...] per view (optional)
+
+Optional time-axis entries (dynamic datasets, e.g. DyCheck):
+    {key}.times.npy          # (N,) float32 - per-view timestamp in seconds
+    {key}.time_ids.npy       # (N,) int32 - per-view frame/time index
+    {key}.cam_ids.npy        # (N,) int32 - per-view physical camera id
+    {key}.cov{i}.webp        # binary covisibility mask (val views only)
+
+Optional dynamic-scene entries (e.g. MV-Kubric):
+    {key}.seg{i}.webp        # instance-id map (uint8 in channel 0, 0 = background)
+    {key}.dyn{i}.webp        # binary dynamic mask (255 = pixel of an object that moves)
+    {key}.tracks_xyz.npy     # (T, P, 3) float32 - world-frame 3D point tracks
+    {key}.tracks_vis.npy     # (C, T, P) bool - per-camera visibility of every track
+    {key}.tracks_seg.npy     # (P,) int32 - instance id of every track (0 = background)
+
+Optional covisibility rankings (scripts/precompute_rankings.py, read by the `rank` sampler):
+    {key}.rankings.npy       # (N, k) int16 - per view its k most covisible views, self first
+    {key}.overlaps.npy       # (N, k) float32 - mutual overlap (min of both directions)
+    {key}.seen_by.npy        # (N, k) float32 - fraction of the view's pixels seen by the other
+    {key}.sees.npy           # (N, k) float32 - fraction of the other's pixels seen by the view
 
 Provides:
 - Image encode (lossless WebP) / decode (JPEG/PNG/WebP -> HWC numpy)
@@ -170,22 +189,32 @@ def write_scene_to_tar(tar: tarfile.TarFile, scene: dict):
             "has_depth": bool
             "depths": list[bytes] | None - WebP bytes from encode_depth
             "depth_ranges": list[tuple[float, float]] | None
+        Optional time-axis keys (written only when present):
+            "times": (N,) float32 ndarray - per-view timestamp in seconds
+            "time_ids": (N,) int32 ndarray - per-view frame/time index
+            "cam_ids": (N,) int32 ndarray - per-view physical camera id
+            "covisibles": dict[int, bytes] - binary mask WebP per view index
+            "meta_extra": dict - extra fields merged into meta.json
+        Optional dynamic-scene keys (written only when present):
+            "segmentations": dict[int, bytes] - instance-id map WebP per view index
+            "dynamics": dict[int, bytes] - binary dynamic mask WebP per view index
+            "tracks_xyz" / "tracks_vis" / "tracks_seg": ndarrays, see TRACK_MEMBERS
     """
     key = scene["key"]
     n = scene["num_views"]
 
-    _tar_add(
-        tar,
-        f"{key}.meta.json",
-        json.dumps(
-            {
-                "num_views": n,
-                "has_depth": scene["has_depth"],
-            }
-        ).encode(),
-    )
+    meta = {"num_views": n, "has_depth": scene["has_depth"]}
+    meta.update(scene.get("meta_extra") or {})
+    _tar_add(tar, f"{key}.meta.json", json.dumps(meta).encode())
     _tar_add(tar, f"{key}.cameras.npy", _npy_bytes(scene["cameras"].astype(np.float32)))
     _tar_add(tar, f"{key}.poses.npy", _npy_bytes(scene["poses"].astype(np.float32)))
+
+    if scene.get("times") is not None:
+        _tar_add(tar, f"{key}.times.npy", _npy_bytes(scene["times"].astype(np.float32)))
+    if scene.get("time_ids") is not None:
+        _tar_add(tar, f"{key}.time_ids.npy", _npy_bytes(scene["time_ids"].astype(np.int32)))
+    if scene.get("cam_ids") is not None:
+        _tar_add(tar, f"{key}.cam_ids.npy", _npy_bytes(scene["cam_ids"].astype(np.int32)))
 
     for i in range(n):
         ext = _detect_ext(scene["images"][i])
@@ -196,23 +225,57 @@ def write_scene_to_tar(tar: tarfile.TarFile, scene: dict):
             _tar_add(tar, f"{key}.dep{i}.webp", scene["depths"][i])
         _tar_add(tar, f"{key}.depth_ranges.json", json.dumps(scene["depth_ranges"]).encode())
 
+    for i, mask_bytes in (scene.get("covisibles") or {}).items():
+        _tar_add(tar, f"{key}.cov{i}.webp", mask_bytes)
+    for i, mask_bytes in (scene.get("segmentations") or {}).items():
+        _tar_add(tar, f"{key}.seg{i}.webp", mask_bytes)
+    for i, mask_bytes in (scene.get("dynamics") or {}).items():
+        _tar_add(tar, f"{key}.dyn{i}.webp", mask_bytes)
+
+    for name in RANKING_MEMBERS + TRACK_MEMBERS:
+        if scene.get(name) is not None:
+            _tar_add(tar, f"{key}.{name}.npy", _npy_bytes(scene[name]))
+
+
+# Per-scene covisibility arrays (see the module docstring), rankings int16, scores float32.
+RANKING_MEMBERS = ("rankings", "overlaps", "seen_by", "sees")
+# Per-scene point tracks (see the module docstring).
+TRACK_MEMBERS = ("tracks_xyz", "tracks_vis", "tracks_seg")
+
 
 def _parse_tar_entry(name: str, data: bytes, scene: dict):
     """Parse a single tar entry into the scene dict."""
     if name.endswith(".meta.json"):
         scene["meta"] = json.loads(data)
+    elif name.endswith(tuple(f".{m}.npy" for m in RANKING_MEMBERS + TRACK_MEMBERS)):
+        scene[name.split(".")[-2]] = np.load(io.BytesIO(data))
     elif name.endswith(".cameras.npy"):
         scene["cameras"] = np.load(io.BytesIO(data))
     elif name.endswith(".poses.npy"):
         scene["poses"] = np.load(io.BytesIO(data))
     elif name.endswith(".depth_ranges.json"):
         scene["depth_ranges"] = [tuple(r) for r in json.loads(data)]
+    elif name.endswith(".times.npy"):
+        scene["times"] = np.load(io.BytesIO(data))
+    elif name.endswith(".time_ids.npy"):
+        scene["time_ids"] = np.load(io.BytesIO(data))
+    elif name.endswith(".cam_ids.npy"):
+        scene["cam_ids"] = np.load(io.BytesIO(data))
     elif ".img" in name:
         idx = int(name.split(".img")[1].split(".")[0])
         scene["images"][idx] = data
     elif ".dep" in name:
         idx = int(name.split(".dep")[1].split(".")[0])
         scene["depths"][idx] = data
+    elif ".cov" in name:
+        idx = int(name.split(".cov")[1].split(".")[0])
+        scene.setdefault("covisibles", {})[idx] = data
+    elif ".seg" in name:
+        idx = int(name.split(".seg")[1].split(".")[0])
+        scene.setdefault("segmentations", {})[idx] = data
+    elif ".dyn" in name:
+        idx = int(name.split(".dyn")[1].split(".")[0])
+        scene.setdefault("dynamics", {})[idx] = data
 
 
 def read_scenes_from_tar(path: str) -> list[dict]:

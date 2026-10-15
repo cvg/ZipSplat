@@ -6,6 +6,7 @@ Author: Alexander Veicht
 from typing import Optional, Tuple, Union
 
 import torch
+
 from zipsplat.utils import TensorWrapper
 
 
@@ -46,9 +47,9 @@ class Camera(TensorWrapper):
         cx: Optional[torch.Tensor] = None,
         cy: Optional[torch.Tensor] = None,
     ) -> "Camera":
-        """Build from focal length(s) and image size.
+        """Camera from focal lengths and the image size.
 
-        fy defaults to fx (square pixels); principal point defaults to image center.
+        `fy` defaults to `fx`, the principal point to the image centre.
         """
         fx = torch.as_tensor(fx, dtype=torch.float32)
         fy = fx if fy is None else torch.as_tensor(fy, dtype=torch.float32)
@@ -67,9 +68,9 @@ class Camera(TensorWrapper):
         w: int,
         h: int,
     ) -> "Camera":
-        """Build from FOV(s) in radians and image size.
+        """Camera from fields of view in radians and the image size.
 
-        fov_y defaults to fov_x; principal point at image center.
+        `fov_y` defaults to `fov_x`, the principal point sits at the image centre.
         """
         fov_x = torch.as_tensor(fov_x, dtype=torch.float32)
         fov_y = fov_x if fov_y is None else torch.as_tensor(fov_y, dtype=torch.float32)

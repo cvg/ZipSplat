@@ -1,4 +1,4 @@
-"""Visualization of predicted and ground truth for a single batch."""
+"""Training and eval figures for one batch of predictions and ground truth."""
 
 import math
 from typing import Any
@@ -10,11 +10,10 @@ from einops import rearrange
 
 from splatfactory.gaussians import Gaussians
 from splatfactory.geometry import Camera, Pose
-from splatfactory.geometry.utils import PCA
+from splatfactory.geometry.utils.scale import mean_cam_transform
 from splatfactory.models.metrics import calculate_lpips, calculate_psnr
-from splatfactory.utils.conversions import reconstruct_feature_img
 from splatfactory.utils.mappings import batch_to_device
-from splatfactory.visualization import viz2d, viz3d
+from splatfactory.visualization import viz2d
 
 PLOT_DPI = 50
 
@@ -28,7 +27,16 @@ def _short_scene_id(scene_id: str) -> str:
 
 
 def tensor_to_img(t):
+    """[3, H, W] tensor -> [H, W, 3] CPU image in [0, 1]."""
     return t.cpu().detach().permute(1, 2, 0).clip(0, 1)
+
+
+def _scene_info_text(data, idx: int = 0) -> str:
+    """Scene name + view counts, overlaid on the first ground-truth view."""
+    scene = _short_scene_id(data["scene"][idx])
+    n_ctx = len(data["context"]["image"][idx])
+    n_tgt = len(data["target"]["image"][idx])
+    return f"{scene}\n{n_ctx} ctx -> {n_tgt} tgt"
 
 
 def compute_view_scores(pred_rgb: torch.Tensor, gt_image: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -47,359 +55,102 @@ def format_score_text(scores: dict[str, torch.Tensor], view_idx: int) -> str:
     )
 
 
-def make_query_mask_figure(
-    title: str,
-    scores: torch.Tensor,
-    pred_mask: torch.Tensor,
-    gt_mask: torch.Tensor,
-    iou: float,
-    data: dict[str, Any],
-) -> dict[str, Any]:
-    """Create a figure for visualizing the query mask and ground truth mask."""
-    img = data["image"][0].permute(1, 2, 0).cpu()
-    titles = [title, "Heatmap", "Pred Mask", "GT Mask"]
-    fig, ax = viz2d.plot_images([img] * 4, titles=titles, dpi=PLOT_DPI)
-    viz2d.plot_heatmaps(
-        [scores, pred_mask, gt_mask], vmax=1.0, colorbar=True, alpha=0.9, axes=ax[1:]
-    )
-    viz2d.add_text(-2, f"IoU: {iou:.3f}", axes=ax)
-    return {"query_mask": fig}
-
-
-def make_rendering_figure(
-    pred: dict[str, torch.Tensor], data: dict[str, torch.Tensor], n_pairs: int = 2
-) -> dict[str, Any]:
-    """Create a figure for visualizing the gt image and renderings."""
-    if "rendering" not in pred:
-        return {}
-
-    n_pairs = min(n_pairs, len(data["image"]))
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    img_pairs, scores = [], []
-    for i in range(n_pairs):
-        img, rendering = data["image"][i], pred["rendering"][i]
-        scores.append(
-            {"psnr": calculate_psnr(img, rendering), "lpips": calculate_lpips(img, rendering)}
-        )
-        img_pairs.append([i.permute(1, 2, 0).clip(0, 1) for i in [img, rendering]])
-
-    titles = ["Image", "Rendering"]
-    fig, ax = viz2d.plot_image_grid(img_pairs, titles=[titles] * n_pairs, set_lim=True)
-
-    for i in range(len(img_pairs)):
-        img, rendering = data["image"][i], pred["rendering"][i]
-        txt = f"PSNR: {scores[i]['psnr']:.2f}\nLPIPS: {scores[i]['lpips']:.4f}"
-        viz2d.add_text(1, txt, axes=ax[i])
-
-    return {"rendering": fig}
-
-
 def make_context_and_targets_figure(
     pred: dict[str, torch.Tensor],
     data: dict[str, torch.Tensor],
     n_pairs: int = 2,
     dpi: int = PLOT_DPI,
+    show_context: bool = False,
 ) -> dict[str, Any]:
-    if "context_rgb" not in pred or "target_rgb" not in pred:
+    """One row per view, one column per quantity. Optional columns are skipped when missing."""
+    if "target_rgb" not in pred:
         return {}
+    show_context = show_context and "context_rgb" in pred
 
     idx = 0
-    # TODO: support n_pairs > 1
     pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
     data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
 
-    n_context, n_target = (len(data["context"]["image"][idx]), len(data["target"]["image"][idx]))
+    splits = (["context"] if show_context else []) + ["target"]
 
-    context_scores = compute_view_scores(pred["context_rgb"][idx], data["context"]["image"][idx])
-    target_scores = compute_view_scores(pred["target_rgb"][idx], data["target"]["image"][idx])
+    n_context = len(data["context"]["image"][idx])
+    has_overlap = all(f"overlap_{split}" in pred for split in splits)
+    has_cluster = all(f"cluster_rgb_{split}" in pred for split in splits)
+    has_token_pca = all(f"token_pca_{split}" in pred for split in splits)
+    has_gt_depth = all("depth" in data[split] for split in splits)
 
-    context_imgs = [tensor_to_img(img) for img in data["context"]["image"][idx]]
-    target_imgs = [tensor_to_img(img) for img in data["target"]["image"][idx]]
-    context_rgb = [tensor_to_img(img) for img in pred["context_rgb"][idx]]
-    target_rgb = [tensor_to_img(img) for img in pred["target_rgb"][idx]]
+    def _masked(t):
+        t = t.clone().float()
+        t[t < 0] = float("nan")  # invalid depth -> transparent
+        return t
 
-    titles_1 = ["Context"] * n_context + ["Target"] * n_target
-    titles_2 = ["Context Rendering"] * n_context + ["Target Rendering"] * n_target
-    titles_3 = ["Context Depth"] * n_context + ["Target Depth"] * n_target
-    titles_4 = ["Context Diff x3"] * n_context + ["Target Diff x3"] * n_target
+    gt_imgs, renderings, clusters, token_pcas, diffs = [], [], [], [], []
+    gt_depths, depths, overlaps = [], [], []
+    id_texts, score_texts = [], []
+    for split in splits:
+        gt = data[split]["image"][idx]
+        rgb = pred[f"{split}_rgb"][idx]
+        scores = compute_view_scores(rgb, gt)
+        for i in range(len(gt)):
+            gt_imgs.append(tensor_to_img(gt[i]))
+            renderings.append(tensor_to_img(rgb[i]))
+            diffs.append(tensor_to_img((rgb[i] - gt[i]).abs() * 3))  # diff amplified 3x
+            depths.append(pred[f"{split}_depth"][idx][i])
+            if has_cluster:
+                clusters.append(tensor_to_img(pred[f"cluster_rgb_{split}"][idx][i]))
+            if has_token_pca:
+                token_pcas.append(tensor_to_img(pred[f"token_pca_{split}"][idx][i]))
+            if has_gt_depth:
+                gt_depths.append(_masked(data[split]["depth"][idx][i]))
+            if has_overlap:
+                overlaps.append(_masked(pred[f"overlap_{split}"][i]))
+            img_id = int(data[split]["index"][idx][i].item())
+            id_texts.append(f"{split.capitalize()} ID: {img_id}")
+            score_texts.append(format_score_text(scores, i))
+    id_texts[0] = _scene_info_text(data, idx) + "\n" + id_texts[0]
 
-    # Compute per-pixel RGB diff (amplified 3x)
-    context_diff = [
-        tensor_to_img((p - gt).abs() * 3)
-        for p, gt in zip(pred["context_rgb"][idx], data["context"]["image"][idx])
+    # Shared scale for the two depth columns (GT invalids are nan already).
+    depth_pool = torch.stack(depths).flatten()
+    if has_gt_depth:
+        g = torch.stack(gt_depths).flatten()
+        depth_pool = torch.cat([depth_pool, g[g.isfinite()]])
+    max_depth = depth_pool.quantile(0.95).item()
+    depth_kw = dict(colorbar=True, vmax=max_depth, alpha=1.0)
+    overlap_kw = dict(cmap="turbo", vmax=n_context, colorbar=True, alpha=1.0)
+
+    # (header, per-view base images, per-view heatmaps or None, heatmap kwargs)
+    columns = [
+        ("GT", gt_imgs, None, None),
+        ("Rendering", renderings, None, None),
+        ("Diff x3", diffs, None, None),
     ]
-    target_diff = [
-        tensor_to_img((p - gt).abs() * 3)
-        for p, gt in zip(pred["target_rgb"][idx], data["target"]["image"][idx])
-    ]
+    if has_overlap:
+        columns.append(("Ctx Overlap", gt_imgs, overlaps, overlap_kw))
+    if has_gt_depth:
+        columns.append(("GT Depth", gt_imgs, gt_depths, depth_kw))
+    columns.append(("Depth", gt_imgs, depths, depth_kw))
+    if has_cluster:
+        columns.append(("Clusters", clusters, None, None))
+    if has_token_pca:
+        columns.append(("Token PCA", token_pcas, None, None))
 
-    fig, ax = viz2d.plot_image_grid(
-        [
-            context_imgs + target_imgs,
-            context_rgb + target_rgb,
-            context_imgs + target_imgs,  # depth row (placeholders)
-            context_diff + target_diff,
-        ],
-        titles=[titles_1, titles_2, titles_3, titles_4],
-        dpi=dpi,
-    )
+    n_views = len(gt_imgs)
+    grid = [[col[1][i] for col in columns] for i in range(n_views)]
+    titles = [[col[0] for col in columns]] + [[""] * len(columns) for _ in range(n_views - 1)]
 
-    context_max = torch.quantile(pred["context_depth"], 0.95).item()
-    target_max = torch.quantile(pred["target_depth"], 0.95).item()
-    max_depth = max(context_max, target_max)
+    fig, ax = viz2d.plot_image_grid(grid, titles=titles, dpi=dpi)
+    ax = np.array(ax).reshape(n_views, len(columns))
 
-    for i in range(len(context_imgs)):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["context"]["index"][idx][i].item())
-        viz2d.add_text(i, f"{scene}\nID: {img_id}", axes=ax[0])
-
-        depth = pred["context_depth"][idx][i]
-        viz2d.plot_heatmaps([depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[2, i]])
-
-    for i in range(len(target_imgs)):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["target"]["index"][idx][i].item())
-        viz2d.add_text(len(context_imgs) + i, f"{scene}\nID: {img_id}", axes=ax[0])
-
-        depth = pred["target_depth"][idx][i]
-        viz2d.plot_heatmaps(
-            [depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[2, len(context_imgs) + i]]
-        )
-
-    for i in range(n_context):
-        viz2d.add_text(i, format_score_text(context_scores, i), axes=ax[1])
-
-    for i in range(n_target):
-        viz2d.add_text(n_context + i, format_score_text(target_scores, i), axes=ax[1])
+    for i in range(n_views):
+        viz2d.add_text(0, id_texts[i], axes=ax[i])
+        viz2d.add_text(1, score_texts[i], axes=ax[i])
+    for c, (_, _, maps, kw) in enumerate(columns):
+        if maps is None:
+            continue
+        for i in range(n_views):
+            viz2d.plot_heatmaps([maps[i]], axes=[ax[i, c]], **kw)
 
     return {"context_and_target": fig}
-
-
-def make_cluster_figure(
-    pred: dict[str, torch.Tensor],
-    data: dict[str, torch.Tensor],
-    n_pairs: int = 2,
-    dpi: int = PLOT_DPI,
-) -> dict[str, Any]:
-    if "cluster_rgb_context" not in pred or "cluster_rgb_target" not in pred:
-        return {}
-
-    idx = 0
-    # TODO: support n_pairs > 1
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    n_context, n_target = (len(data["context"]["image"][idx]), len(data["target"]["image"][idx]))
-
-    context_scores = compute_view_scores(pred["context_rgb"][idx], data["context"]["image"][idx])
-    target_scores = compute_view_scores(pred["target_rgb"][idx], data["target"]["image"][idx])
-
-    context_imgs = [tensor_to_img(img) for img in data["context"]["image"][idx]]
-    target_imgs = [tensor_to_img(img) for img in data["target"]["image"][idx]]
-    context_rgb = [tensor_to_img(img) for img in pred["context_rgb"][idx]]
-    target_rgb = [tensor_to_img(img) for img in pred["target_rgb"][idx]]
-    context_cluster = [tensor_to_img(img) for img in pred["cluster_rgb_context"][idx]]
-    target_cluster = [tensor_to_img(img) for img in pred["cluster_rgb_target"][idx]]
-
-    titles_1 = ["Context"] * n_context + ["Target"] * n_target
-    titles_2 = ["Context Rendering"] * n_context + ["Target Rendering"] * n_target
-    titles_3 = ["Context Clusters"] * n_context + ["Target Clusters"] * n_target
-
-    fig, ax = viz2d.plot_image_grid(
-        [context_imgs + target_imgs, context_rgb + target_rgb, context_cluster + target_cluster],
-        titles=[titles_1, titles_2, titles_3],
-        dpi=dpi,
-    )
-
-    for i in range(n_context):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["context"]["index"][idx][i].item())
-        viz2d.add_text(i, f"{scene}\nID: {img_id}", axes=ax[0])
-        viz2d.add_text(i, format_score_text(context_scores, i), axes=ax[1])
-
-    for i in range(n_target):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["target"]["index"][idx][i].item())
-        viz2d.add_text(n_context + i, f"{scene}\nID: {img_id}", axes=ax[0])
-        viz2d.add_text(n_context + i, format_score_text(target_scores, i), axes=ax[1])
-
-    return {"cluster": fig}
-
-
-def make_depth_figure(
-    pred: dict[str, torch.Tensor],
-    data: dict[str, torch.Tensor],
-    n_pairs: int = 2,
-    dpi: int = PLOT_DPI,
-) -> dict[str, Any]:
-    if "context_depth" not in pred or "depth" not in data["context"]:
-        return {}
-
-    idx = 0
-    # TODO: support n_pairs > 1
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    context_imgs = [tensor_to_img(img) for img in data["context"]["image"][idx]]
-    target_imgs = [tensor_to_img(img) for img in data["target"]["image"][idx]]
-
-    n_context, n_target = len(context_imgs), len(target_imgs)
-    titles_1 = ["Context"] * n_context + ["Target"] * n_target
-    titles_2 = ["Context Rendering"] * n_context + ["Target Rendering"] * n_target
-
-    fig, ax = viz2d.plot_image_grid(
-        [context_imgs + target_imgs] * 2, titles=[titles_1, titles_2], dpi=dpi
-    )
-
-    context_max = torch.quantile(data["context"]["depth"], 0.95).item()
-    target_max = torch.quantile(data["target"]["depth"], 0.95).item()
-    max_depth = max(context_max, target_max)
-
-    # Add GT depths to context images
-    for i in range(len(context_imgs)):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["context"]["index"][idx][i].item())
-        viz2d.add_text(i, f"{scene}\nID: {img_id}", axes=ax[0])
-
-        depth = data["context"]["depth"][idx][i]
-        viz2d.plot_heatmaps([depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[0, i]])
-
-        depth = pred["context_depth"][idx][i]
-        viz2d.plot_heatmaps([depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[1, i]])
-
-    for i in range(len(target_imgs)):
-        scene = _short_scene_id(data["scene"][idx])
-        img_id = int(data["target"]["index"][idx][i].item())
-        viz2d.add_text(len(context_imgs) + i, f"{scene}\nID: {img_id}", axes=ax[0])
-
-        depth = data["target"]["depth"][idx][i]
-        viz2d.plot_heatmaps(
-            [depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[0, len(context_imgs) + i]]
-        )
-
-        depth = pred["target_depth"][idx][i]
-        viz2d.plot_heatmaps(
-            [depth], colorbar=True, vmax=max_depth, alpha=1.0, axes=[ax[1, len(context_imgs) + i]]
-        )
-
-    return {"depth": fig}
-
-
-def make_feature_figure(
-    pred: dict[str, torch.Tensor],
-    data: dict[str, torch.Tensor],
-    n_pairs: int = 2,
-) -> dict[str, Any]:
-    """Create a figure for visualizing the gt image and renderings."""
-    if "rendering" not in pred:
-        return {}
-
-    n_pairs = min(n_pairs, len(data["image"]))
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    pca = None
-
-    img_pairs, titles = [], []
-    for i in range(n_pairs):
-        img = data["image"][i]
-        row = [img]
-        titles = ["Image"]
-
-        H, W = img.shape[-2:]
-        levels = np.array(data["levels"]).squeeze()
-        levels = levels[None] if levels.ndim == 0 else levels
-
-        for level_id, level in enumerate(levels):
-            gt_features = reconstruct_feature_img(
-                features=data[f"{level}_features"],
-                indices=data[f"{level}_indices"],
-                target_shape=(H, W),
-            )[0]
-            features = pred["feature_map"][i, level_id]
-
-            gt_features = rearrange(gt_features, "C H W -> (H W) C")
-            features = rearrange(features, "C H W -> (H W) C")
-
-            if pca is None:
-                pca = PCA(n_components=3)
-                pca.fit(torch.unique(gt_features, dim=0))
-
-            if gt_features.shape[-1] == features.shape[-1]:
-                gt_features = pca.normalize(pca.transform(gt_features))
-                features = pca.normalize(pca.transform(features))
-            else:
-                pca = PCA(n_components=3)
-                pca.fit(torch.unique(gt_features, dim=0))
-                gt_features = pca.normalize(pca.transform(gt_features))
-
-                pca.fit(torch.unique(features, dim=0))
-                features = pca.normalize(pca.transform(features))
-
-            gt_features = rearrange(gt_features, "(H W) C -> C H W", H=H, W=W)
-            features = rearrange(features, "(H W) C -> C H W", H=H, W=W)
-
-            titles += [f"GT Features {level}", f"Pred Features {level}"]
-            row += [gt_features, features]
-
-        img_pairs.append([i.permute(1, 2, 0).clip(0, 1) for i in row])
-
-    fig, ax = viz2d.plot_image_grid(
-        img_pairs, titles=[titles] * n_pairs, set_lim=True, dpi=PLOT_DPI
-    )
-
-    return {"features": fig}
-
-
-def make_3d_figure(
-    pred: dict[str, torch.Tensor], data: dict[str, torch.Tensor], n_pairs: int = 2
-) -> dict[str, Any]:
-    """Create a figure for visualizing the gt image and renderings."""
-    if "gaussians" not in pred:
-        return {}
-
-    n_pairs = min(n_pairs, len(data["context"]["image"]))
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    fig = viz3d.init_figure()
-    context = data["context"]
-    viz3d.plot_cameras(fig, context["pose"][0], context["camera"][0], scale=3)
-
-    gaussians: Gaussians = pred["gaussians"][0]
-    viz3d.plot_points(fig, gaussians.means, color=gaussians.rgb)
-
-    return {"3d_points": fig}
-
-
-def make_prototype_figure(
-    pred: dict[str, torch.Tensor], data: dict[str, torch.Tensor], n_pairs: int = 2
-) -> dict[str, Any]:
-    """Create a figure for visualizing the gt image and renderings."""
-    if "gaussians" not in pred or "prototype_ids" not in pred:
-        return {}
-
-    n_pairs = min(n_pairs, len(data["context"]["image"]))
-    pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
-    data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
-
-    fig = viz3d.init_figure()
-    context = data["context"]
-    viz3d.plot_cameras(fig, context["pose"][0], context["camera"][0], scale=3)
-
-    gaussians: Gaussians = pred["gaussians"][0]
-    cmap = plt.get_cmap("tab20")
-    colors = []
-    for pid in pred["prototype_ids"]:
-        color = np.array(cmap(pid % 20)[:3])
-        color = (color * 255).astype(np.uint8)
-        colors.append(color)
-    colors = np.array(colors)
-    viz3d.plot_points(fig, gaussians.means, color=colors)
-
-    return {"prototypes": fig}
 
 
 def make_attention_figure(
@@ -416,7 +167,7 @@ def make_attention_figure(
     pred = batch_to_device(pred, "cpu", detach=True, non_blocking=False)
     data = batch_to_device(data, "cpu", detach=True, non_blocking=False)
 
-    attention_maps = pred["attention"]  # (B, N, H, W)
+    attention_maps = pred["attention"]
     attention_maps = torch.stack(attention_maps)
     attention_maps = rearrange(attention_maps, "L B N T -> B L T N")[:n_pairs]  # (B, L, T, N)
 
@@ -532,35 +283,127 @@ def make_gaussian_stats_figure(
     return {"gaussian_stats": fig}
 
 
+def _draw_frusta_2d(ax, render_pose, K, poses, cameras, depth, color, label):
+    """Project per-view camera frusta into a rendered panel and draw them as lines.
+
+    Args:
+        ax: panel axes.
+        render_pose: [1] c2w pose of the panel's render camera.
+        K: [3, 3] pixel intrinsics of the render camera.
+        poses: [V] c2w poses to draw.
+        cameras: [V] cameras to draw, each with its own fov.
+        depth: frustum depth in scene units.
+        color: line color.
+        label: legend label.
+    """
+    w2c = render_pose.inv()
+    Rw, tw = w2c.R.reshape(3, 3), w2c.t.reshape(3)
+    R_v = poses.R.reshape(-1, 3, 3)
+    t_v = poses.t.reshape(-1, 3)
+    hf, vf = cameras.hfov.reshape(-1), cameras.vfov.reshape(-1)
+    edges = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 2), (2, 3), (3, 4), (4, 1)]
+    for v in range(t_v.shape[0]):
+        x = math.tan(hf[v].item() / 2) * depth
+        y = math.tan(vf[v].item() / 2) * depth
+        local = torch.tensor(
+            [[0, 0, 0], [-x, -y, depth], [x, -y, depth], [x, y, depth], [-x, y, depth]],
+            dtype=t_v.dtype,
+            device=t_v.device,
+        )
+        world = local @ R_v[v].T + t_v[v]
+        cam = world @ Rw.T + tw
+        z = cam[:, 2].clamp(min=1e-6)
+        uv = (cam[:, :2] / z[:, None]) @ K[:2, :2].T + K[:2, 2]
+        uv, valid = uv.cpu().numpy(), (cam[:, 2] > 1e-4).cpu().numpy()
+        for a, b in edges:
+            if valid[a] and valid[b]:
+                ax.plot(*np.stack([uv[a], uv[b]]).T, color=color, lw=0.9, alpha=0.9)
+        if valid[0]:
+            ax.plot(uv[0, 0], uv[0, 1], ".", color=color, ms=3)
+    ax.plot([], [], color=color, lw=1, label=label)  # one legend entry per pose set
+
+
+def _pulled_back_pose(R_base, t_base, pitch, pull):
+    """Pitch the view down by `pitch` and pull the camera back by `pull` (elevated overview)."""
+    fwd, down = R_base[:, 2], R_base[:, 1]
+    fwd = torch.nn.functional.normalize(fwd * math.cos(pitch) + down * math.sin(pitch), dim=0)
+    down = torch.nn.functional.normalize(down - (down @ fwd) * fwd, dim=0)
+    right = torch.linalg.cross(down, fwd)
+    R = torch.stack([right, down, fwd], dim=-1)
+    return Pose.from_Rt(R[None], (t_base - fwd * pull)[None])
+
+
 def make_gaussian_figure(
     pred: dict[str, torch.Tensor], data: dict[str, torch.Tensor], dpi: int = PLOT_DPI
 ) -> dict[str, Any]:
-    """Create a figure for visualizing Gaussians from multiple orbit views."""
+    """Gaussians from elevated mean-cam and identity views, with the context frusta.
+
+    GT frusta are green, the predicted ones (when the model has a pose head) red.
+    """
     if "gaussians" not in pred:
         return {}
 
     gaussians: Gaussians = pred["gaussians"][0]
+    device = gaussians.means.device
+    ctx_pose: Pose = data["context"]["pose"][0].to(device)
+    ctx_cam: Camera = data["context"]["camera"][0].to(device)
+
     center = gaussians.means.median(dim=0).values
-    radius = (gaussians.means - center).norm(dim=-1).quantile(0.9) * 1.2
-    # radius = 0.8
+    radius = ((gaussians.means - center).norm(dim=-1).quantile(0.9) * 1.2).item()
+    pull, pitch = 1.1 * radius, math.radians(20.0)
 
-    # Create camera with 90 degree FOV
     H, W = 512, 512
-    fov = torch.tensor([math.pi / 2], device=data["context"]["image"].device)
-    camera = Camera.from_fov(fov, fov, H, W)
+    fov = torch.tensor([math.radians(65.0)], device=device)
+    camera = Camera.from_fov(fov, fov, w=W, h=H).to(device)
+    K = camera.K.reshape(3, 3)
 
-    # Define orbit views: (azimuth, elevation, title)
-    azimuths = [0, 20, 90, 0]
-    elevations = [0, 20, 0, 90]
-    titles = ["Front", "Oblique", "Side", "Top"]
+    avg_c2w = torch.linalg.inv(mean_cam_transform(ctx_pose.Rt))
+    mean_pose = _pulled_back_pose(avg_c2w[:3, :3], avg_c2w[:3, 3], pitch, pull)
+    eye = torch.eye(3, device=device)
+    id_pose = _pulled_back_pose(eye, torch.zeros(3, device=device), pitch, pull)
 
-    poses = Pose.orbit(center, radius, azimuths, elevations)
-    cameras = camera.repeat(len(azimuths))
+    poses = torch.cat([mean_pose, id_pose], dim=0)
+    render = gaussians.render_view(
+        camera.repeat(2), poses, backgrounds=torch.ones(2, 3, device=device)
+    )
+    imgs = [tensor_to_img(render["rendering"][i]) for i in range(2)]
 
-    render = gaussians.render_view(cameras, poses)
-    renderings = [tensor_to_img(render["rendering"][i]) for i in range(len(azimuths))]
+    fig, axs = viz2d.plot_images(imgs, titles=["mean-cam", "identity"], dpi=dpi)
 
-    fig, _ = viz2d.plot_images(renderings, titles=titles, dpi=dpi)
+    pose_sets = [(ctx_pose, ctx_cam, "green", "GT")]
+    if "pose_pred" in pred:
+        pose_sets.append(
+            (pred["pose_pred"][0].to(device), pred["camera_pred"][0].to(device), "red", "pred")
+        )
+    frustum_depth = 0.13 * radius
+    for ax, rp in zip(axs, (mean_pose, id_pose)):
+        for p, c, color, label in pose_sets:
+            _draw_frusta_2d(ax, rp, K, p, c, frustum_depth, color, label)
+        ax.set_xlim(0, W)
+        ax.set_ylim(H, 0)
+    axs[0].legend(fontsize=7, loc="upper right")
+
+    if "pose_pred" in pred:
+        pp, pc = pose_sets[1][0], pose_sets[1][1]
+        cos = ((pp.R.transpose(-1, -2) @ ctx_pose.R).diagonal(dim1=-2, dim2=-1).sum(-1) - 1) / 2
+        rot_deg = torch.rad2deg(torch.acos(cos.clamp(-1, 1)))
+        # center error and the scale-free pairwise translation-direction angle
+        t_err = (pp.t - ctx_pose.t).norm(dim=-1)
+        i, j = torch.triu_indices(len(t_err), len(t_err), offset=1)
+        d_pred = torch.nn.functional.normalize(pp.t[i] - pp.t[j], dim=-1)
+        d_gt = torch.nn.functional.normalize(ctx_pose.t[i] - ctx_pose.t[j], dim=-1)
+        tdir_deg = torch.rad2deg(torch.acos((d_pred * d_gt).sum(-1).abs().clamp(max=1.0)))
+        fov_deg = torch.rad2deg(
+            torch.stack([pc.vfov - ctx_cam.vfov, pc.hfov - ctx_cam.hfov], -1).abs()
+        )
+        viz2d.add_text(
+            0,
+            f"R {rot_deg.median():.1f} deg\n"
+            f"t {t_err.median():.3f}\n"
+            f"t-dir {tdir_deg.median():.1f} deg\n"
+            f"fov {fov_deg.median():.1f} deg",
+            axes=axs,
+        )
     return {"gaussians": fig}
 
 
@@ -569,24 +412,28 @@ def visualize_batch(
     data: dict[str, torch.Tensor],
     n_pairs: int = 1,
     dpi: int = 50,
+    show_context: bool = False,
 ) -> dict[str, Any]:
-    """Create visualization figures for a batch of predictions and ground truth."""
+    """Figures for one batch of predictions and ground truth.
+
+    Args:
+        pred: model predictions.
+        data: the batch.
+        n_pairs: number of batch elements to plot.
+        dpi: figure resolution.
+        show_context: also plot the context views (default: targets only).
+    """
     n_pairs = max(1, n_pairs)
 
     if "image" in data:
         n_pairs = min(n_pairs, len(data["image"]))
 
     figures = {}
-    # TODO: Add functions for figures
-    # figures |= make_rendering_figure(pred, data, n_pairs=n_pairs, dpi=dpi)
-    figures |= make_context_and_targets_figure(pred, data, n_pairs=n_pairs, dpi=dpi)
-    figures |= make_depth_figure(pred, data, n_pairs=n_pairs, dpi=dpi)
-    # figures |= make_3d_figure(pred, data, n_pairs=n_pairs)
-    # figures |= make_prototype_figure(pred, data, n_pairs=n_pairs)
-    figures |= make_cluster_figure(pred, data, n_pairs=n_pairs, dpi=dpi)
+    figures |= make_context_and_targets_figure(
+        pred, data, n_pairs=n_pairs, dpi=dpi, show_context=show_context
+    )
     figures |= make_attention_figure(pred, data, n_pairs=n_pairs, dpi=dpi)
     figures |= make_gaussian_figure(pred, data, dpi=dpi)
     figures |= make_gaussian_stats_figure(pred, data, dpi=dpi)
 
-    # {f.tight_layout() for f in figures.values()}
     return figures

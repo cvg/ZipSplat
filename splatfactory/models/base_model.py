@@ -4,6 +4,7 @@ Adapted from gluefactory (https://github.com/cvg/glue-factory), Apache-2.0.
 """
 
 import re
+import time
 from abc import ABCMeta, abstractmethod
 from copy import copy
 from pathlib import Path
@@ -13,15 +14,9 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
-# Released checkpoints, downloaded on demand (see `weights` in a model config).
-RELEASED_WEIGHTS = {
-    "zipsplat": "https://huggingface.co/veichta/zipsplat/resolve/main/zipsplat-da3g-252p.tar",
-}
-
 
 def load_weights(weights: str):
-    """Load a checkpoint from a released-weights name, an http(s) URL, or a local path."""
-    weights = RELEASED_WEIGHTS.get(weights, weights)
+    """Load a checkpoint from an http(s) URL or a local path."""
     if str(weights).startswith(("http://", "https://")):
         return torch.hub.load_state_dict_from_url(
             weights,
@@ -83,7 +78,7 @@ class BaseModel(nn.Module, metaclass=MetaModel):
         "name": None,
         "trainable": True,  # if false: do not optimize this model parameters
         "freeze_batch_normalization": False,  # use test-time statistics
-        "timeit": False,  # time forward pass
+        "timeit": False,  # measure _forward wall clock into pred["forward_time"]
         "visualize": True,  # visualize model predictions
         "compile": True,  # compile the model for faster inference
         "compile_loss": True,  # compile losses for faster inference
@@ -172,20 +167,21 @@ class BaseModel(nn.Module, metaclass=MetaModel):
                     "parameters:" + "\n\t".join(sorted(dict_params))
                 )
         common_params = dict_params & model_params
-        left_params = dict_params - model_params
-        left_params = [
-            p for p in left_params if "running" not in p and "num_batches_tracked" not in p
-        ]
         logger.debug("Loading parameters:\n\t" + "\n\t".join(sorted(common_params)))
-        if left_params:
-            module_names = set([n.split(".")[0] for n in left_params])
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        unexpected = [
+            p for p in unexpected if "running" not in p and "num_batches_tracked" not in p
+        ]
+        if unexpected:
+            module_names = set([n.split(".")[0] for n in unexpected])
             logger.warning(
-                f"Parameters in checkpoint but not loaded in model -> {len(left_params)}: {list(module_names)}"
+                f"Parameters in checkpoint but not loaded in model -> {len(unexpected)}: {list(module_names)}"
             )
-            # print("\t" + "\n\t".join(sorted(left_params)))
-            # print()
-            # print("Model parameters:\n\t" + "\n\t".join(sorted(model_params)))
-        self.load_state_dict(state_dict, strict=False)
+        if missing:
+            module_names = set([n.split(".")[0] for n in missing])
+            logger.warning(
+                f"Model parameters not found in checkpoint -> {len(missing)}: {list(module_names)}"
+            )
 
     def train(self, mode=True):
         super().train(mode)
@@ -209,7 +205,21 @@ class BaseModel(nn.Module, metaclass=MetaModel):
                     recursive_key_check(expected[key], given[key])
 
         recursive_key_check(self.required_data_keys, data)
-        pred = self._forward(data)
+
+        if self.conf.timeit:
+            # Wall-clock cost of producing a prediction, as `forward_time` [1] so any method
+            # carries a comparable time column (one forward pass for a feed-forward model,
+            # the whole fit for a per-scene one). Off by default: the syncs it needs to be
+            # truthful would serialize training.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            pred = self._forward(data)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            pred["forward_time"] = torch.tensor([time.perf_counter() - t0], dtype=torch.float64)
+        else:
+            pred = self._forward(data)
 
         if self.conf.run_loss_in_forward:
             pred["loss"] = self.loss(pred, data)

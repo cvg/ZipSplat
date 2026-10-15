@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 from contextlib import contextmanager
+from threading import Timer
 
 
 def apply_backspaces_and_linefeeds(text):
@@ -78,7 +79,6 @@ def capture_outputs(filename, cleanup_interval=None):
     """Duplicate stdout and stderr to a file on the file descriptor level."""
 
     if cleanup_interval is not None:
-        from threading import Timer
 
         class RepeatTimer(Timer):
             def run(self):

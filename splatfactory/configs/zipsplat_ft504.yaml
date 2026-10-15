@@ -1,0 +1,43 @@
+# 504 px finetune (the zipsplat release): the zipsplat.yaml recipe at G=16 on the 504 px
+# multi-dataset mix, initialized from a zipsplat.yaml run with model.gaussians_per_token=16.
+defaults:
+  - zipsplat
+  - override data: multi_dataset_504
+  - _self_
+
+model:
+  weights: outputs/training/zipsplat-g16/checkpoint_best.tar
+  gaussians_per_token: 16
+  # same 65-token floor as 0.1 at 252 px (0.025 x 1296 tokens x 2 views), eval uses the max
+  query_sample_ratio: [0.025, 1.0]
+  gaussian_head:
+    # whole-scene SH dropout: half the scenes render with degree > 0 zeroed
+    sh_dropout: 0.5
+  # memory at 504 px: checkpoint the DA3 trunk, the fusion stack fits without
+  use_checkpoint: false
+  backbone:
+    use_checkpoint: true
+  return_attention: false
+
+data:
+  view_schedule: 0  # full view range from step 0
+  preprocessing:
+    resize: 504
+  # one pass over the weighted pool (~4M scene draws) outlasts the run, so cap an epoch at
+  # ~2K steps (checkpoints and evals run per epoch) and use a small val set
+  samples_per_epoch: 80_000
+  val_samples: 512
+
+benchmarks:
+  dl3dv_benchmark:
+    data:
+      dataset_dir: data/dl3dv/540x960
+      preprocessing:
+        resize: 504
+
+train:
+  num_steps: 100_000
+  lr: 1e-4
+  run_benchmarks: [dl3dv_benchmark]
+  eval_every_epoch: 2
+  benchmark_every_epoch: 2

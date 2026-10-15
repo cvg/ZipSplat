@@ -28,6 +28,23 @@ from splatfactory.models.modules.transformer_block import Mlp, SelfAttentionBloc
 logger = get_logger(__name__)
 
 
+def sinusoidal_time_encoding(timestamps: torch.Tensor, embed_dim: int) -> torch.Tensor:
+    """Fixed sinusoidal encoding of per-view timestamps (NoPo4D recipe).
+
+    timestamps [B, S] (ZipSplat4D: seconds from the first input frame) -> [B, S, embed_dim],
+    sin | cos halves, base 10000.
+    No learned parameters: the finetuned alternating blocks learn to read it.
+    """
+    assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
+    num_bands = embed_dim // 2
+    freqs = 1.0 / (
+        10000.0
+        ** (torch.arange(num_bands, dtype=torch.float32, device=timestamps.device) / num_bands)
+    )
+    angles = timestamps.float().unsqueeze(-1) * freqs
+    return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+
 def named_apply(
     fn: Callable, module: nn.Module, name="", depth_first=True, include_root=False
 ) -> nn.Module:
@@ -219,7 +236,7 @@ class DAV3DinoVisionTransformer(BaseModel):
         x = rearrange(x, "(b s) n c -> b s n c", b=B, s=S)
         return x
 
-    def _prepare_rope(self, B, S, H, W, device):
+    def _prepare_rope(self, B, S, H, W, device, extra_specials=0):
         pos = None
         pos_nodiff = None
         if self.rope is not None:
@@ -228,31 +245,37 @@ class DAV3DinoVisionTransformer(BaseModel):
             )
             pos = rearrange(pos, "(b s) n c -> b s n c", b=B)
             pos_nodiff = torch.zeros_like(pos).to(pos.dtype)
-            if self.conf.patch_start_idx > 0:
+            n_special = self.conf.patch_start_idx + extra_specials
+            if n_special > 0:
                 pos = pos + 1
-                pos_special = (
-                    torch.zeros(B * S, self.conf.patch_start_idx, 2).to(device).to(pos.dtype)
-                )
+                pos_special = torch.zeros(B * S, n_special, 2).to(device).to(pos.dtype)
                 pos_special = rearrange(pos_special, "(b s) n c -> b s n c", b=B)
                 pos = torch.cat([pos_special, pos], dim=2)
                 pos_nodiff = pos_nodiff + 1
                 pos_nodiff = torch.cat([pos_special, pos_nodiff], dim=2)
         return pos, pos_nodiff
 
+    def _insert_time_tokens(self, x, timestamps):
+        """Insert one fixed sinusoidal time token per view after the cls + register tokens."""
+        time_tok = sinusoidal_time_encoding(timestamps, self.embed_dim)[:, :, None].to(x.dtype)
+        idx = 1 + self.num_register_tokens
+        return torch.cat([x[:, :, :idx], time_tok, x[:, :, idx:]], dim=2)
+
+    def _strip_time_tokens(self, x):
+        idx = 1 + self.num_register_tokens
+        return torch.cat([x[:, :, :idx], x[:, :, idx + 1 :]], dim=2)
+
     def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
         B, S, _, H, W = x.shape
+        timestamps = kwargs.get("timestamps", None)
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output, local_x = [], len(self.blocks), [], None
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
+        has_time_token = False
 
         use_ckpt = self.conf.use_checkpoint and self.training
         for i, blk in enumerate(self.blocks):
-            if i < self.rope_start or self.rope is None:
-                g_pos, l_pos = None, None
-            else:
-                g_pos = pos_nodiff
-                l_pos = pos
             if self.alt_start != -1 and i == self.alt_start:
                 if kwargs.get("cam_token", None) is not None:
                     logger.debug("Using camera conditions provided by the user")
@@ -263,6 +286,25 @@ class DAV3DinoVisionTransformer(BaseModel):
                     cam_token = torch.cat([ref_token, src_token], dim=1)
                     logger.debug("Using learned camera conditions")
                 x[:, :, 0] = cam_token
+
+                if timestamps is not None:
+                    # Time token (4D): one fixed sinusoidal token per view, RoPE position 0
+                    # like the other specials, visible only to the alternating blocks and
+                    # stripped from every output.
+                    assert (
+                        kwargs.get("attn_mask", None) is None
+                    ), "attn_mask and time tokens are mutually exclusive (token count changes)"
+                    x = self._insert_time_tokens(x, timestamps)
+                    if local_x is not None:
+                        local_x = self._insert_time_tokens(local_x, timestamps)
+                    has_time_token = True
+                    pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device, extra_specials=1)
+
+            if i < self.rope_start or self.rope is None:
+                g_pos, l_pos = None, None
+            else:
+                g_pos = pos_nodiff
+                l_pos = pos
 
             is_global = self.alt_start != -1 and i >= self.alt_start and i % 2 == 1
             attn_type = "global" if is_global else "local"
@@ -286,10 +328,12 @@ class DAV3DinoVisionTransformer(BaseModel):
                 local_x = x
 
             if i in blocks_to_take:
-                out_x = torch.cat([local_x, x], dim=-1) if self.cat_token else x
+                x_out = self._strip_time_tokens(x) if has_time_token else x
+                lx_out = self._strip_time_tokens(local_x) if has_time_token else local_x
+                out_x = torch.cat([lx_out, x_out], dim=-1) if self.cat_token else x_out
                 output.append((out_x[:, :, 0], out_x))
             if i in export_feat_layers:
-                aux_output.append(x)
+                aux_output.append(self._strip_time_tokens(x) if has_time_token else x)
         return output, aux_output
 
     def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
@@ -447,7 +491,7 @@ if __name__ == "__main__":
     sd = {k: v for k, v in sd.items() if not k.startswith("head.")}
 
     torch.save(sd, "weights/da3-small.pth")
-    ckpt = torch.load("weights/da3-small.pth", map_location="cpu", weights_only=True)
+    state = torch.load("weights/da3-small.pth", map_location="cpu", weights_only=True)
 
     model = vit_small(weights="weights/da3-small.pth")
     sample = torch.randn(2, 5, 3, 518, 518)

@@ -1,22 +1,18 @@
-# Core dependencies for the splatfactory training/eval package (PEP 508, no poetry).
-# The two CUDA extensions need a built torch + nvcc and must be installed with
-# --no-build-isolation, so they are NOT listed here. See the "Training" section in the README:
-#   pip install --no-build-isolation --use-pep517 \
-#       git+https://github.com/JoannaCCJH/gsplat.git \
-#       git+https://github.com/rahul-goel/fused-ssim/
+# Core dependencies of the splatfactory training and eval package. Rendering needs a CUDA GPU.
 torch
 torchvision
+triton
 numpy<2
 einops
 omegaconf
 hydra-core
+gsplat
 h5py
 pandas
 tqdm
 matplotlib
 opencv-python
 albumentations
-chamferdist
 lpips
 imageio[ffmpeg]
 plotly
@@ -24,6 +20,7 @@ safetensors
 scikit-image
 scikit-learn
 tabulate
+tensorboard
 tensordict
 wandb
 huggingface-hub

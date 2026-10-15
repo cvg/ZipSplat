@@ -1,6 +1,8 @@
 torch
+triton
 numpy<2
 einops
+tqdm
 matplotlib
 gsplat
 plyfile

@@ -21,6 +21,7 @@ import torch
 from einops import rearrange
 from gsplat.rendering import rasterization
 from plyfile import PlyData, PlyElement
+
 from zipsplat.camera import Camera
 from zipsplat.pose import Pose
 from zipsplat.utils import TensorWrapper
@@ -134,6 +135,10 @@ class Gaussians(TensorWrapper):
 
     # ------------------------- methods -------------------------
 
+    def float(self) -> "Gaussians":
+        """Cast underlying data to float32."""
+        return Gaussians(self.data_.float())
+
     def scale(self, factor: Union[float, torch.Tensor]) -> "Gaussians":
         """Uniformly scale the scene (means and scales) by a factor."""
         factor = factor if not hasattr(factor, "shape") else factor[..., None, None]
@@ -178,7 +183,7 @@ class Gaussians(TensorWrapper):
         """Render the scene at the given cameras / poses (gsplat).
 
         Args:
-            cameras: Camera — scalar (single view), [V], or [B, V]. Moved to the scene's device.
+            cameras: Camera -- scalar (single view), [V], or [B, V]. Moved to the scene's device.
             poses: Pose with matching shape.
             mode: "RGB" (3 ch), "D" (1 ch), "ED" (1 ch), "RGB+D" (4 ch), "RGB+ED" (4 ch).
             sh_degree: SH degree to use. Defaults to ``self.max_sh_degree``.

@@ -1,10 +1,7 @@
 """Multi-view IterableDataset backed by tar shards.
 
-Streams scenes from tar shards with worker-local batching.
-Each worker independently: splits shards -> shuffles -> streams scenes ->
-samples views -> decodes -> normalizes -> collates -> yields batches.
-
-DataLoader(batch_size=None) passes batches through unchanged.
+Each worker splits the shards, shuffles, streams scenes, samples views, decodes, normalizes and
+yields whole batches, which DataLoader(batch_size=None) passes through unchanged.
 
 Author: Alexander Veicht
 """
@@ -25,20 +22,28 @@ from splatfactory.datasets.base_dataset import BaseDataset
 from splatfactory.datasets.utils import io, workers
 from splatfactory.datasets.view_sampler import get_view_sampler
 from splatfactory.geometry import Camera, Pose
-from splatfactory.geometry.scale import compute_scene_scale
+from splatfactory.geometry.utils.scale import (
+    compute_scene_scale,
+    context_point_centroid,
+    mean_cam_down_transform,
+    mean_cam_transform,
+)
 from splatfactory.utils import mappings
 from splatfactory.utils.image import ImagePreprocessor
-from splatfactory.utils.tools import StepTimer
+from splatfactory.utils.timing import StepTimer
 
 logger = get_logger(__name__)
 
 
-class MultiViewDataset(BaseDataset, IterableDataset):
-    """Multi-view dataset that streams scenes from tar shards.
+def resolve_shard_paths(shard_dirs, shard_glob: str = "shard-*.tar") -> list[Path]:
+    """Sorted, deduplicated shard files of one directory or a list of them."""
+    if isinstance(shard_dirs, (str, Path)):
+        shard_dirs = [shard_dirs]
+    return sorted({p for d in shard_dirs for p in Path(str(d)).glob(shard_glob)})
 
-    Each DataLoader worker independently splits shards, samples view counts,
-    assembles complete batches, and yields them via DataLoader(batch_size=None).
-    """
+
+class MultiViewDataset(BaseDataset, IterableDataset):
+    """Multi-view dataset that streams scenes from tar shards in worker-local batches."""
 
     base_default_conf = {
         "name": "???",
@@ -48,17 +53,29 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         "test_shard_dir": "${.dataset_dir}/test-shards",
         "shard_glob": "shard-*.tar",
         "image_num_range": [2, 24],
-        "aspect_ratio_range": [1.0, 1.0],
+        "aspect_ratios": [1.0],
+        "zoom_range": None,  # [min, max] center zoom crop per scene (train only), e.g. [0.8, 1.0]
         "num_target_views": 4,
         "random_reference_view": True,
         "view_sampler": {"name": "bounded"},
         "augmentations": {"name": "identity"},
         "preprocessing": {},
         "use_relative_poses": True,
-        "normalize_baseline": False,
+        # Frame of the poses:
+        #   first_cam: the first context view (the ZipSplat training frame)
+        #   mean_cam: the average context camera
+        #   mean_cam_down: the average camera with the mean down axis primary
+        #   mean_point: first-view rotation, origin at the median context depth point
+        #   mean_point_const: first-view rotation, origin shifted one unit along its axis
+        "reference_frame": "first_cam",
+        "normalize_baseline": False,  # scene scale, see geometry/utils/scale.py
+        "scene_scale_constant": None,  # fixed scene scale instead of the computed one
+        # near / far in the normalized frame, not divided by the per-scene scale
         "near": 0.01,
         "far": 1000.0,
-        "max_pose_jump_ratio": 10.0,  # 0 disables; otherwise skip if max/median consecutive step > ratio
+        # skip a scene whose largest consecutive camera step exceeds this times the median
+        # one, 0 disables
+        "max_pose_jump_ratio": 10.0,
         "train_batch_size": "???",
         "val_batch_size": 1,
         "test_batch_size": 1,
@@ -77,11 +94,11 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         self.step_timer = StepTimer()
         self.view_timer = StepTimer()
 
-        shard_dir = Path(conf.train_shard_dir if split == "train" else conf.test_shard_dir)
-        self.shard_paths: list[Path] = sorted(shard_dir.glob(conf.shard_glob))
+        raw_dirs = conf.train_shard_dir if split == "train" else conf.test_shard_dir
+        self.shard_paths: list[Path] = resolve_shard_paths(raw_dirs, conf.shard_glob)
         if not self.shard_paths:
-            raise FileNotFoundError(f"No shards found in {shard_dir}")
-        logger.info(f"[{split}] Found {len(self.shard_paths)} shards in {shard_dir}")
+            raise FileNotFoundError(f"No shards found in {raw_dirs}")
+        logger.info(f"[{split}] Found {len(self.shard_paths)} shards in {raw_dirs}")
 
         self.view_sampler = get_view_sampler(conf.view_sampler.name)(conf.view_sampler, split=split)
 
@@ -137,7 +154,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         return self.conf.get(self.split + "_batch_size", self.conf.batch_size)
 
     def __len__(self) -> int:
-        """Approximate length. Eval: valid scenes from index; train: shard count."""
+        """Approximate length: the valid scenes of the eval indices, else the shard count."""
         if hasattr(self.view_sampler, "valid_scenes"):
             n = len(self.view_sampler.valid_scenes)
             if self.conf.max_samples is not None:
@@ -211,13 +228,12 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         view_sampler=None,
         preprocessor=None,
         dataset_name: str | None = None,
+        max_pose_jump_ratio: float | None = None,
     ) -> dict:
-        """Process a raw scene dict into a training sample.
+        """Sample views of a raw scene, decode them and normalize their frame and scale.
 
-        view sampling -> decode -> pose normalization -> scale normalization -> near/far.
-
-        ComposedDataset passes child-specific view_sampler/preprocessor/dataset_name;
-        single-dataset callers let them default to self.*.
+        ComposedDataset passes its child's sampler, preprocessor, name and jump ratio, which
+        otherwise default to this dataset's own.
         """
         if view_sampler is None:
             view_sampler = self.view_sampler
@@ -225,6 +241,8 @@ class MultiViewDataset(BaseDataset, IterableDataset):
             preprocessor = self.preprocessor
         if dataset_name is None:
             dataset_name = self.conf.dataset_name
+        if max_pose_jump_ratio is None:
+            max_pose_jump_ratio = self.conf.max_pose_jump_ratio
 
         key = raw_scene["key"]
         meta = raw_scene["meta"]
@@ -234,55 +252,91 @@ class MultiViewDataset(BaseDataset, IterableDataset):
             num_context_views=num_context_views,
             num_target_views=self.conf.num_target_views,
             total_num_views=meta["num_views"],
+            scene=raw_scene,
         )
 
-        if self.conf.max_pose_jump_ratio > 0:
+        if max_pose_jump_ratio > 0:
             all_idx = sorted(indices["context_indices"] + indices["target_indices"])
             lo, hi = all_idx[0], all_idx[-1]
             if hi - lo >= 2:
                 translations = raw_scene["poses"][lo : hi + 1, 9:12]
                 steps = np.linalg.norm(np.diff(translations, axis=0), axis=1)
                 median_step = np.median(steps)
-                if median_step > 0 and steps.max() / median_step > self.conf.max_pose_jump_ratio:
+                if median_step > 0 and steps.max() / median_step > max_pose_jump_ratio:
                     raise ValueError(f"pose jump ratio {steps.max() / median_step:.0f}")
 
         if self.conf.random_reference_view and self.split == "train":
             np.random.shuffle(indices["context_indices"])
 
+        zoom = 1.0  # one zoom per scene: all views keep the same camera
+        if self.conf.zoom_range is not None and self.split == "train":
+            zoom = random.uniform(*self.conf.zoom_range)
+
         context = mappings.stack_tree(
             [
-                self._load_view(raw_scene, i, aspect_ratio, preprocessor)
+                self._load_view(raw_scene, i, aspect_ratio, preprocessor, zoom)
                 for i in indices["context_indices"]
             ]
         )
         target = mappings.stack_tree(
             [
-                self._load_view(raw_scene, i, aspect_ratio, preprocessor)
+                self._load_view(raw_scene, i, aspect_ratio, preprocessor, zoom)
                 for i in indices["target_indices"]
             ]
         )
         self.step_timer.measure("decode")
 
         if self.conf.use_relative_poses:
-            ref = context["pose"][0].inv()
+            if self.conf.reference_frame == "mean_cam":
+                ref = Pose.from_4x4mat(mean_cam_transform(context["pose"].Rt))
+            elif self.conf.reference_frame == "mean_cam_down":
+                # heading anchor: context slot 0, as for first_cam, which the model can observe
+                ref = Pose.from_4x4mat(mean_cam_down_transform(context["pose"].Rt))
+            elif self.conf.reference_frame == "mean_point":
+                # first_cam with the origin moved to the median context depth point
+                ref = context["pose"][0].inv()
+                centroid = context_point_centroid(
+                    context["pose"], context["camera"], context["depth"], context["depth_mask"]
+                )
+                if centroid is not None:
+                    ref = Pose.from_Rt(ref.R, -(ref.R @ centroid))
+            elif self.conf.reference_frame == "mean_point_const":
+                # first_cam here, the origin shift follows the scale normalization below
+                ref = context["pose"][0].inv()
+            else:
+                ref = context["pose"][0].inv()
             context["pose"] = ref @ context["pose"]
             target["pose"] = ref @ target["pose"]
 
-        scale = compute_scene_scale(
-            context["pose"],
-            context["camera"],
-            context["depth"],
-            context["depth_mask"],
-            num_context_views,
-            self.conf.normalize_baseline,
-        )
-        inv_scale = 1.0 / scale
+        if self.conf.scene_scale_constant is not None:
+            inv_scale = float(self.conf.scene_scale_constant)
+            scale = 1.0 / inv_scale
+        else:
+            scale = compute_scene_scale(
+                context["pose"],
+                context["camera"],
+                context["depth"],
+                context["depth_mask"],
+                num_context_views,
+                self.conf.normalize_baseline,
+            )
+            inv_scale = 1.0 / scale
         context["pose"] = context["pose"].scale_translation(inv_scale)
         target["pose"] = target["pose"].scale_translation(inv_scale)
         for g in (context, target):
             g["depth"] = torch.where(g["depth_mask"], g["depth"] * inv_scale, g["depth"])
 
-        near, far = self.conf.near / scale, self.conf.far / scale
+        shift = None
+        if self.conf.use_relative_poses and self.conf.reference_frame == "mean_point_const":
+            # move the origin one normalized unit along the first view's optical axis (+z)
+            t = context["pose"].t
+            shift = Pose.from_Rt(
+                torch.eye(3, dtype=t.dtype, device=t.device), t.new_tensor([0.0, 0.0, -1.0])
+            )
+            context["pose"] = shift @ context["pose"]
+            target["pose"] = shift @ target["pose"]
+
+        near, far = self.conf.near, self.conf.far  # normalized-frame constants (see conf)
         for g, n in (
             (context, len(indices["context_indices"])),
             (target, len(indices["target_indices"])),
@@ -290,6 +344,15 @@ class MultiViewDataset(BaseDataset, IterableDataset):
             g["near"] = torch.full((n,), near)
             g["far"] = torch.full((n,), far)
         self.step_timer.measure("normalize")
+
+        def to_norm(points: torch.Tensor) -> torch.Tensor:
+            """Raw-world points [..., 3] -> this sample's normalized frame."""
+            if self.conf.use_relative_poses:
+                points = ref.transform(points)
+            points = points * inv_scale
+            return points if shift is None else shift.transform(points)
+
+        self._add_fields(raw_scene, indices, context, target, to_norm)
 
         return {
             "name": f"{dataset_name}-{key}",
@@ -302,7 +365,12 @@ class MultiViewDataset(BaseDataset, IterableDataset):
 
     # ---- View loading --------------------------------------------------------
     def _load_view(
-        self, scene: dict, view_index: int, aspect_ratio: float = 1.0, preprocessor=None
+        self,
+        scene: dict,
+        view_index: int,
+        aspect_ratio: float = 1.0,
+        preprocessor=None,
+        zoom: float = 1.0,
     ) -> dict:
         """Decode and preprocess a single view from raw scene bytes."""
         if preprocessor is None:
@@ -317,7 +385,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
         depth = self._decode_depth(scene, view_index)
         self.view_timer.measure("depth_decode")
 
-        data = preprocessor(image, depth=depth, aspect_ratio=aspect_ratio)
+        data = preprocessor(image, depth=depth, aspect_ratio=aspect_ratio, zoom=zoom)
         self.view_timer.measure("preprocess")
 
         camera = camera.compose_image_transform(data["transform"])
@@ -331,6 +399,12 @@ class MultiViewDataset(BaseDataset, IterableDataset):
             "depth_mask": data.get("depth_mask", torch.zeros(hw, dtype=torch.bool)),
             "index": torch.tensor([view_index], dtype=torch.float32),
         }
+
+    def _add_fields(self, scene: dict, indices: dict, context: dict, target: dict, to_norm) -> None:
+        """Hook: add per-sample fields to context/target in place, after normalization.
+
+        to_norm maps raw-world points [..., 3] into the sample's normalized frame. No-op here.
+        """
 
     def _decode_depth(self, scene: dict, view_index: int):
         """Decode depth bytes to numpy float32. Returns None if unavailable."""
@@ -353,7 +427,7 @@ class MultiViewDataset(BaseDataset, IterableDataset):
     def _sample_batch_params(self, rng: random.Random, is_train: bool) -> tuple[int, float, int]:
         """Sample view count, aspect ratio, and batch size for one batch."""
         vc = rng.randint(self._image_num_range[0], self._image_num_range[1])
-        ar = round(rng.uniform(*self.conf.aspect_ratio_range), 2)
+        ar = float(rng.choice(list(self.conf.aspect_ratios)))
         bs = max(1, self.max_img_per_gpu // vc)
         return vc, ar, bs
 
@@ -366,6 +440,13 @@ class MultiViewDataset(BaseDataset, IterableDataset):
 
         if hasattr(view_sampler, "valid_scenes") and key not in view_sampler.valid_scenes:
             logger.debug(f"Scene {key} not in valid_scenes, skipping")
+            return False
+
+        missing = [
+            k for k in getattr(view_sampler, "required_scene_keys", ()) if k not in raw_scene
+        ]
+        if missing:
+            logger.debug(f"Scene {key} lacks {missing}, skipping")
             return False
 
         if (

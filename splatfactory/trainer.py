@@ -7,8 +7,8 @@ Adapted from gluefactory (https://github.com/cvg/glue-factory), Apache-2.0.
 """
 
 import collections
+import contextlib
 import gc
-import math
 import signal
 from pathlib import Path
 from typing import Any, TypeAlias
@@ -16,14 +16,15 @@ from typing import Any, TypeAlias
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch._dynamo
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from splatfactory import __module_name__, datasets, eval, logger, models, settings
 from splatfactory.models import BaseModel
-from splatfactory.models.misc import format_module_params
-from splatfactory.utils import experiments, mappings, tools
+from splatfactory.models.utils.misc import format_module_params
+from splatfactory.utils import experiments, mappings, optim, summary_writer, timing, tools
 from splatfactory.utils.distributed import get_distributed_env
 from splatfactory.utils.metrics import AverageMetric, MedianMetric, PRMetric, RecallMetric
 from splatfactory.utils.summary_writer import SummaryWriter
@@ -185,9 +186,14 @@ class Trainer:
         "matmul_precision": None,  # Set torch.matmul precision [None, highest, high, medium, low]
         "overfit": False,  # Overfit a single batch
         # Optimizer parameters
-        "optimizer": "Adam",  # name of optimizer torch.optim.* e.g Adam, SGD, ...
+        "optimizer": "AdamW",  # name of optimizer torch.optim.* e.g Adam, SGD, ...
         "opt_regexp": None,  # regular expression to filter parameters to optimize
-        "optimizer_options": {},  # optional arguments passed to the optimizer
+        # Regexp, matched params get weight_decay=0. The default skips 1D params (LayerScale
+        # gammas, biases, norm gains and biases). None disables.
+        "weight_decay_skip": "gamma|bias|norm",
+        # fused=True: single multi-tensor CUDA update kernel. Real training hyperparameters
+        # (weight_decay, betas) live in the train block of configs/zipsplat.yaml.
+        "optimizer_options": {"fused": True},
         "lr": 0.001,  # learning rate
         "lr_schedule": {
             "type": None,
@@ -198,7 +204,9 @@ class Trainer:
         },
         "lr_scaling": {},  # learning rate scaling for parameter name patterns
         "clip_grad": None,
-        "gradient_accumulation_steps": 1,  # Accumulate gradients over N steps
+        # Micro-batches per optimizer step. One iteration = one optimizer step: num_steps,
+        # the LR / view / query schedules and the log cadence all count optimizer steps.
+        "gradient_accumulation_steps": 1,
         # Data parameters
         "train_split": "train",  # split to use for training
         "eval_split": "val",  # split to use for evaluation
@@ -219,16 +227,18 @@ class Trainer:
         "plot_every_iter": None,  # plot figures every X iterations
         "stdout_metrics": ["loss/total"],  # List of metrics to print to stdout (None=all)
         "record_memory": None,  # Record memory usage during training (# record steps)
-        "log_it": False,  # Log tensorboard on iteration (default is num_samples)
+        "log_it": True,  # Log on iteration (default); set False to log against num_samples
         "print_arch": 1,  # Print model architecture (None=skip, int=depth)
         # Restarting and loading
         "load_experiment": None,  # initialize the model from a previous experiment
-        "submodules": [],
         # Misc options
         "compile": None,  # Compilation mode for the model. [None, default, ...]
         "profile": None,  # Profile the training with PyTorch profiler (# prof steps)
         "profile_every_epoch": None,  # Profile every N epochs, None means only first
         "ddp_find_unused_parameters": False,  # DDP find_unused_parameters
+        # DDP grads alias the reduction buckets (saves one full gradient copy, ~4 bytes
+        # per trainable param).
+        "ddp_gradient_as_bucket_view": False,
         "stop_immediately": True,  # Stop training immediately on SIGINT
         "debug_nan": False,  # Log detailed info and raise on NaN gradients
         "project_name": __module_name__,  # wandb project name
@@ -277,8 +287,8 @@ class Trainer:
         self.use_mp = self.setup_dtype_scaler(conf.mixed_precision)
 
         # Initialize step timer
-        self.step_timer = tools.StepTimer()
-        self.epoch_timer = tools.EpochTimer()
+        self.step_timer = timing.StepTimer()
+        self.epoch_timer = timing.EpochTimer()
 
         # Setup counters
         self.epoch = 0
@@ -310,7 +320,7 @@ class Trainer:
         """Create a Trainer instance from a config."""
         conf = OmegaConf.merge(cls.default_conf, conf)
         optimizer = cls.construct_optimizer(conf, model)
-        lr_scheduler = tools.get_lr_scheduler(optimizer=optimizer, conf=conf.lr_schedule)
+        lr_scheduler = optim.get_lr_scheduler(optimizer=optimizer, conf=conf.lr_schedule)
         return cls(
             conf=conf,
             model=model,
@@ -534,23 +544,6 @@ class Trainer:
         current_max = int(round(current_max))
         self._train_dataset.update_image_num_range(new_max=current_max)
 
-    def _step_query_ratio_schedule(self):
-        """Cosine anneal query ratio_min: 1.0 -> target over scheduled fraction of training."""
-        model = self.model.module if self.distributed else self.model
-        schedule_frac = getattr(model.conf, "query_ratio_schedule", 0.0)
-        if not schedule_frac or not self.conf.num_steps:
-            return
-
-        if not hasattr(self, "_qr_target"):
-            self._qr_target = model.conf.query_sample_ratio[0]
-
-        T = int(self.conf.num_steps * schedule_frac)
-        t = min(self.tot_it, T)
-        ratio_min = self._qr_target + (1.0 - self._qr_target) * 0.5 * (
-            1 + math.cos(math.pi * t / T)
-        )
-        model.query_sample_ratio[0] = ratio_min
-
     def setup_sigint_handler(self):
         def sigint_handler(signal, frame):
             logger.info("Caught keyboard interrupt signal, will terminate")
@@ -570,12 +563,16 @@ class Trainer:
 
     def prepare_model(self):
         if self.conf.compile is not None:
+            # DDPOptimizer graph-split chokes on the head's dynamic-view shapes
+            # ("SymIntArrayRef expected to contain only concrete integers"); disable it.
+            torch._dynamo.config.optimize_ddp = False
             # Compile before DDP
             self.model = self.model.compile(mode=self.conf.compile)
         if self.distributed:
             self.model = self.model.make_ddp(
                 device_ids=[self.device],
                 find_unused_parameters=self.conf.ddp_find_unused_parameters,
+                gradient_as_bucket_view=self.conf.ddp_gradient_as_bucket_view,
             )
 
     def construct_profiler(
@@ -604,8 +601,10 @@ class Trainer:
 
         params = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
         if conf.opt_regexp:
-            params = tools.filter_parameters(params, conf.opt_regexp)
-        lr_params = tools.pack_lr_parameters(params, conf.lr, conf.lr_scaling)
+            params = optim.filter_parameters(params, conf.opt_regexp)
+        lr_params = optim.pack_lr_parameters(
+            params, conf.lr, conf.lr_scaling, weight_decay_skip=conf.weight_decay_skip
+        )
         optimizer = optimizer_fn(lr_params, lr=conf.lr, **conf.optimizer_options)
         return optimizer
 
@@ -708,7 +707,7 @@ class Trainer:
     ):
         tot_n_samples = self.current_it
         all_params = self.model.parameters()
-        writer.add_scalar("l2/param_norm", tools.param_norm(all_params), tot_n_samples)
+        writer.add_scalar("l2/param_norm", optim.param_norm(all_params), tot_n_samples)
         loss_metrics = {
             k: v.compute() if hasattr(v, "compute") else v for k, v in train_loss_metrics.items()
         }
@@ -732,22 +731,16 @@ class Trainer:
                 it,
                 memory_used,
                 memory_total,
-                tools._format_count(self.tot_it),
-                tools._format_count(int(total_steps)) if total_steps < float("inf") else "?",
+                timing._format_count(self.tot_it),
+                timing._format_count(int(total_steps)) if total_steps < float("inf") else "?",
                 pct,
                 steps_per_sec,
                 eta_str,
                 ", ".join(str_loss_metrics),
             )
         )
-        tools.write_dict_summaries(writer, "training", loss_metrics, tot_n_samples)
+        summary_writer.write_dict_summaries(writer, "training", loss_metrics, tot_n_samples)
         writer.add_scalar("training/lr", self.optimizer.param_groups[0]["lr"], tot_n_samples)
-
-        model = self.model.module if self.distributed else self.model
-        if getattr(model.conf, "query_ratio_schedule", 0.0):
-            writer.add_scalar(
-                "schedule/query_ratio_min", model.query_sample_ratio[0], tot_n_samples
-            )
 
         if getattr(self, "_view_schedule_frac", 0.0):
             writer.add_scalar(
@@ -765,10 +758,10 @@ class Trainer:
         results, pr_metrics, figures = eval_results
         str_results = [f"{k} {v:.3E}" for k, v in results.items() if isinstance(v, float)]
         logger.info(f'[Validation] {{{", ".join(str_results)}}}')
-        tools.write_dict_summaries(writer, "eval", results, tot_n_samples)
-        tools.write_dict_summaries(writer, "eval", pr_metrics, tot_n_samples)
+        summary_writer.write_dict_summaries(writer, "eval", results, tot_n_samples)
+        summary_writer.write_dict_summaries(writer, "eval", pr_metrics, tot_n_samples)
         if figures is not None:
-            tools.write_image_summaries(writer, "eval", figures, tot_n_samples)
+            summary_writer.write_image_summaries(writer, "eval", figures, tot_n_samples)
 
     def log_time_and_memory(
         self,
@@ -783,12 +776,14 @@ class Trainer:
             self.step_timer.log_stats()
 
             step_duration, section_times = self.step_timer.compute()
-            steps_per_sec = 1 / step_duration
+            # The timer measures micro-steps; report optimizer steps so the ETA stays right.
+            accum = self.conf.gradient_accumulation_steps
+            steps_per_sec = 1 / (step_duration * accum)
             writer.add_scalar("step/total", step_duration, tot_n_samples)
             writer.add_scalar("step/_per_sec", steps_per_sec, tot_n_samples)
             writer.add_scalar(
                 "step/_samples_per_sec",
-                steps_per_sec * batch_size * self.num_gpus,
+                steps_per_sec * batch_size * self.num_gpus * accum,
                 tot_n_samples,
             )
             # Write section timings and fractions of step duration.
@@ -811,10 +806,10 @@ class Trainer:
         # Log memory stats
         memory_used, memory_total = 0.0, 0.0
         if torch.cuda.is_available():
-            device_stats = tools.collect_device_stats()
+            device_stats = timing.collect_device_stats()
             memory_used = device_stats["global_used"]
             memory_total = device_stats["global_total"]
-            tools.write_dict_summaries(writer, "memory", device_stats, tot_n_samples)
+            summary_writer.write_dict_summaries(writer, "memory", device_stats, tot_n_samples)
 
         return memory_used, memory_total, steps_per_sec
 
@@ -827,8 +822,8 @@ class Trainer:
 
         if hasattr(loader.dataset, "stats"):
             data_metrics, data_figures = loader.dataset.stats()
-            tools.write_dict_summaries(writer, name, data_metrics, tot_n_samples)
-            tools.write_image_summaries(writer, name, data_figures, tot_n_samples)
+            summary_writer.write_dict_summaries(writer, name, data_metrics, tot_n_samples)
+            summary_writer.write_image_summaries(writer, name, data_figures, tot_n_samples)
 
         writer.add_scalar(f"{name}/num_batches", len(loader), tot_n_samples)
         writer.add_scalar(
@@ -916,7 +911,7 @@ class Trainer:
                             )
                             if log_grad_norm:
                                 loss_metrics["l2/grad_norm"] = torch.Tensor(
-                                    [tools.grad_norm(self.model.parameters())]
+                                    [optim.grad_norm(self.model.parameters())]
                                 )
                             self.scaler.step(self.optimizer)
                         except RuntimeError:
@@ -930,17 +925,17 @@ class Trainer:
                     else:
                         if log_grad_norm:
                             loss_metrics["l2/grad_norm"] = torch.Tensor(
-                                [tools.grad_norm(self.model.parameters())]
+                                [optim.grad_norm(self.model.parameters())]
                             )
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                     self.optimizer.zero_grad()
 
                 self.step_timer.measure("step")
-                if not self.conf.lr_schedule.on_epoch:
-                    self.learning_rate_step()
-                self._step_query_ratio_schedule()
-                self._step_view_schedule()
+                if do_update:
+                    if not self.conf.lr_schedule.on_epoch:
+                        self.learning_rate_step()
+                    self._step_view_schedule()
             else:
                 self.warn("Skip iteration due to detach.")
 
@@ -1021,15 +1016,28 @@ class Trainer:
             )
             actual_bs = _infer_batch_size(data, nominal_bs)
             self.tot_n_samples += actual_bs * self.num_gpus
-            self.tot_it += 1
+
+            # One iteration = one optimizer step. Accumulation micro-steps in between do not
+            # advance tot_it, the LR / view / query schedules or the log cadence.
+            accum = self.conf.gradient_accumulation_steps
+            do_update = ((it + 1) % accum) == 0
+            if do_update:
+                self.tot_it += 1
+            it_opt = it // accum  # optimizer step within the epoch
 
             self.model.train()
 
-            # Perform gradient accumulation
-            do_update = ((it + 1) % self.conf.gradient_accumulation_steps) == 0
-
-            do_log = it % self.conf.log_every_iter == 0
-            pred, loss_metrics = self.train_step(data, do_update=do_update, log_grad_norm=do_log)
+            do_log = do_update and it_opt % self.conf.log_every_iter == 0
+            # Skip the DDP all-reduce on micro-steps that do not update.
+            sync_ctx = (
+                self.model.no_sync()
+                if self.distributed and not do_update
+                else contextlib.nullcontext()
+            )
+            with sync_ctx:
+                pred, loss_metrics = self.train_step(
+                    data, do_update=do_update, log_grad_norm=do_log
+                )
             if pred is None:
                 continue  # skip iteration due to NaN
 
@@ -1057,25 +1065,28 @@ class Trainer:
 
                 if self.rank == 0:
                     mem_used, mem_total, its_per_sec = self.log_time_and_memory(
-                        writer, it, get_batch_size(dataloader)
+                        writer, it_opt, get_batch_size(dataloader)
                     )
                     self.log_train(
                         writer,
-                        it,
+                        it_opt,
                         computed_metrics,
                         memory_used=mem_used,
                         memory_total=mem_total,
                         steps_per_sec=its_per_sec,
                     )
-                    self.log_data_stats(writer, it, scene_num_samples, split="training")
+                    self.log_data_stats(writer, it_opt, scene_num_samples, split="training")
 
             # Make plots of training steps
             if self.conf.plot_every_iter is not None:
-                if it % self.conf.plot_every_iter == 0 and self.rank == 0:
+                do_plot = do_update and it_opt % self.conf.plot_every_iter == 0
+                if do_plot and self.rank == 0:
                     with torch.no_grad():
                         figures = self.model.visualize(pred, data)
 
-                    tools.write_image_summaries(writer, "training", figures, self.current_it)
+                    summary_writer.write_image_summaries(
+                        writer, "training", figures, self.current_it
+                    )
                     del figures
 
             # Log gradients
@@ -1145,8 +1156,8 @@ class Trainer:
         logger.info(f'[{benchmark_name}] {{{", ".join(str_summaries)}}}')
         if writer is not None:
             step = self.current_it
-            tools.write_dict_summaries(writer, f"test_{benchmark_name}", summaries, step)
-            tools.write_image_summaries(writer, f"test_{benchmark_name}", figures, step)
+            summary_writer.write_dict_summaries(writer, f"test_{benchmark_name}", summaries, step)
+            summary_writer.write_image_summaries(writer, f"test_{benchmark_name}", figures, step)
         del figures
         return summaries
 

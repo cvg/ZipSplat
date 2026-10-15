@@ -6,6 +6,7 @@ Author: Alexander Veicht
 import itertools
 import json
 import os
+import socket
 import tarfile
 import time
 import urllib.request
@@ -22,11 +23,34 @@ from pathlib import Path
 from typing import Callable, Iterable, Iterator
 
 import numpy as np
+from huggingface_hub import HfFileSystem, hf_hub_download
+from huggingface_hub.utils import disable_progress_bars
 from tqdm import tqdm
 
 from splatfactory import get_logger
+from splatfactory.datasets.utils.io import write_scene_to_tar
 
 logger = get_logger(__name__)
+
+# urllib downloads (atomic_download) have no timeout by default: a stalled connection
+# hangs a worker thread forever. 120 s of silence raises instead, and the caller retries.
+socket.setdefaulttimeout(120)
+
+# Extra curl flags for large files from flaky hosts: HTTP/1.1 (HuggingFace cancels HTTP/2
+# streams mid-file, curl 92), abort a connection that stalls below 10 KB/s for 2 min
+# instead of hanging forever, and retry both on the server.
+CURL_ROBUST = [
+    "--http1.1",
+    "--speed-limit",
+    "10000",
+    "--speed-time",
+    "120",
+    "--retry",
+    "5",
+    "--retry-delay",
+    "10",
+    "--retry-all-errors",
+]
 
 
 @dataclass
@@ -127,8 +151,6 @@ def atomic_download(
 
 def verify_hf_access(repo_id: str) -> bool:
     """Check if the user has access to a HuggingFace dataset repo."""
-    from huggingface_hub import HfFileSystem
-
     try:
         fs = HfFileSystem()
         fs.ls(f"datasets/{repo_id}")
@@ -142,8 +164,6 @@ def hf_download(repo_id: str, filename: str, local_dir: Path, retries: int = 3) 
 
     Returns DownloadResult for compatibility with parallel_download.
     """
-    from huggingface_hub import hf_hub_download
-
     local_dir = Path(local_dir)
 
     for attempt in range(retries):
@@ -192,12 +212,7 @@ def parallel_download(
         List of all DownloadResults.
     """
     # Silence HF progress bars when using parallel_download
-    try:
-        from huggingface_hub.utils import disable_progress_bars
-
-        disable_progress_bars()
-    except ImportError:
-        pass
+    disable_progress_bars()
 
     results: list[DownloadResult] = []
     success_count = 0
@@ -249,47 +264,85 @@ def parallel_download(
 
 
 def write_shards(
-    scenes, output_dir: Path, shard_size_mb: int = 512, desc: str = "Writing shards"
+    scenes,
+    output_dir: Path,
+    shard_size_mb: int = 512,
+    desc: str = "Writing shards",
+    total: int | None = None,
+    resume: bool = False,
+    stats: dict | None = None,
 ) -> dict[str, str]:
-    """Write scene dicts to tar shards with automatic size-based rotation.
+    """Write scene dicts to tar shards with size-based rotation and atomic commits.
+
+    Each shard is written to ``shard-NNNNNN.tar.tmp`` and renamed on close, so committed
+    shards are always complete, and ``index.json`` only lists committed shards.
 
     Args:
-        scenes: iterable of scene dicts (matching io.write_scene_to_tar format).
-        output_dir: directory for shard-NNNNNN.tar files + index.json.
-        shard_size_mb: approximate max size per shard in MB.
-        desc: progress bar description.
+        scenes: Scene dicts in the io.write_scene_to_tar format.
+        output_dir: Directory of the shards and index.json.
+        shard_size_mb: Approximate shard size in MB.
+        desc: Progress bar description.
+        total: Expected scene count, for the progress and the projected size.
+        resume: Keep the committed shards, continue their numbering and skip their scenes.
+            Scenes of a partial shard are processed again.
 
     Returns:
-        index: dict mapping scene key -> shard filename.
+        The scene key to shard file name mapping.
     """
-    from splatfactory.datasets.utils.io import write_scene_to_tar
-
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     shard_limit = shard_size_mb * 1024 * 1024
+    index_path = output_dir / "index.json"
+
+    # Drop any partial shard left by a previous crash (never atomically committed).
+    for stale in output_dir.glob("shard-*.tar.tmp"):
+        logger.warning(f"Removing stale {stale.name}")
+        stale.unlink()
 
     index: dict[str, str] = {}
     shard_idx = 0
-    tar = None
-    current_size = 0
-
-    def _open_shard():
-        nonlocal tar, shard_idx, current_size
-        if tar is not None:
-            tar.close()
-        shard_name = f"shard-{shard_idx:06d}.tar"
-        tar = tarfile.open(output_dir / shard_name, "w")
-        current_size = 0
-        shard_idx += 1
-        return shard_name
-
-    shard_name = _open_shard()
     closed_bytes = 0
+    committed_keys: set[str] = set()
+    if resume and index_path.exists():
+        index = json.load(open(index_path))
+        committed_keys = set(index)
+        committed_shards = sorted(set(index.values()))
+        closed_bytes = sum(
+            (output_dir / n).stat().st_size for n in committed_shards if (output_dir / n).exists()
+        )
+        shard_idx = max((int(n[6:12]) for n in committed_shards), default=-1) + 1
+        logger.info(f"Resuming: {len(committed_keys)} scenes committed, next shard {shard_idx}")
+
+    n_resumed = len(index)
+    tar = None
+    tmp_path: Path | None = None
     scenes_in_shard = 0
     n_done = 0
 
-    pbar = tqdm(scenes, desc=desc, ncols=140)
+    def _open_shard() -> str:
+        nonlocal tar, tmp_path, scenes_in_shard
+        shard_name = f"shard-{shard_idx:06d}.tar"
+        tmp_path = output_dir / f"{shard_name}.tmp"
+        tar = tarfile.open(tmp_path, "w")
+        scenes_in_shard = 0
+        return shard_name
+
+    def _commit_shard(shard_name: str):
+        """Atomically commit the current shard: close .tmp -> rename -> flush index."""
+        nonlocal closed_bytes, shard_idx
+        tar.close()
+        final = output_dir / shard_name
+        os.rename(tmp_path, final)
+        closed_bytes += final.stat().st_size
+        with open(index_path, "w") as f:
+            json.dump(index, f)
+        shard_idx += 1
+
+    shard_name = _open_shard()
+    pbar = tqdm(scenes, desc=desc, ncols=100, total=total, initial=n_resumed)
     for scene in pbar:
+        if scene["key"] in committed_keys:
+            continue  # already durable in a committed shard
         write_scene_to_tar(tar, scene)
         tar.fileobj.flush()
         index[scene["key"]] = shard_name
@@ -297,26 +350,30 @@ def write_shards(
         n_done += 1
 
         written = closed_bytes + tar.offset
-        pbar.set_postfix_str(
-            f"shard {shard_idx - 1} ({scenes_in_shard}sc {tar.offset / 1e6:.0f}MB) "
-            f"total={written / 1e9:.1f}GB"
+        accounted = n_resumed + n_done
+        q = f"q={stats['ready']}/{stats['max']} " if stats and "ready" in stats else ""
+        size = (
+            f"{written / 1e9:.0f}/{written / accounted * total / 1e9:.0f}GB"
+            if total
+            else f"{written / 1e9:.1f}GB"
         )
+        pbar.set_postfix_str(f"{q}sh{shard_idx} {size}")
 
         if tar.offset >= shard_limit:
-            closed_bytes += os.path.getsize(output_dir / shard_name)
-            # Flush index after each shard for crash safety
-            with open(output_dir / "index.json", "w") as f:
-                json.dump(index, f)
+            _commit_shard(shard_name)
             shard_name = _open_shard()
-            scenes_in_shard = 0
 
     pbar.close()
 
-    if tar is not None:
+    # Commit the trailing shard if it has content, else drop the empty .tmp.
+    if scenes_in_shard > 0:
+        _commit_shard(shard_name)
+    else:
         tar.close()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
-    # Write final index
-    with open(output_dir / "index.json", "w") as f:
+    with open(index_path, "w") as f:
         json.dump(index, f, indent=2)
 
     logger.info(f"Wrote {len(index)} scenes to {shard_idx} shards in {output_dir}")
@@ -332,19 +389,20 @@ def parallel_map(
     num_workers: int = 0,
     max_pending: int | None = None,
     skip_label: Callable = repr,
+    stats: dict | None = None,
 ) -> Iterator:
-    """Apply fn to items, yielding results as they complete.
+    """Apply fn to items in a process pool, yielding results as they complete.
 
-    Sequential if num_workers == 0; otherwise uses a ProcessPoolExecutor with a
-    bounded in-flight window (max_pending items submitted at once). Exceptions
-    are logged via tqdm.write and the item is skipped.
+    Items whose fn raises are logged and skipped.
 
     Args:
-        fn: callable taking one item, returning one result (or raising).
-        items: iterable of items.
-        num_workers: 0 = sequential, >0 = process pool workers.
-        max_pending: max in-flight futures (default: 2 * num_workers).
-        skip_label: function(item) -> str for the skip message.
+        fn: Function of one item.
+        items: The items.
+        num_workers: Pool size, 0 runs sequentially.
+        max_pending: Cap on items in flight. Default: 2 * num_workers.
+        skip_label: Label of an item in the skip message.
+        stats: Optional dict, kept updated with the window size ("max") and the finished
+            results not yet consumed ("ready").
     """
     if num_workers == 0:
         for item in items:
@@ -355,6 +413,8 @@ def parallel_map(
         return
 
     max_pending = max_pending or num_workers * 2
+    if stats is not None:
+        stats["max"] = max_pending
     with ProcessPoolExecutor(max_workers=num_workers) as pool:
         src = iter(items)
         futures = {pool.submit(fn, it): it for it in itertools.islice(src, max_pending)}
@@ -362,6 +422,8 @@ def parallel_map(
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
             for f in done:
                 item = futures.pop(f)
+                if stats is not None:
+                    stats["ready"] = sum(1 for g in futures if g.done())
                 try:
                     yield f.result()
                 except Exception as e:

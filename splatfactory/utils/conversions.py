@@ -95,13 +95,12 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
         dim=-2,
     )
 
-    # We floor here at 0.1 but the exact level is not important; if q_abs is small,
-    # the candidate won't be picked.
+    # The floor at 0.1 is arbitrary, a candidate with a small q_abs is never picked.
     flr = torch.tensor(0.1).to(dtype=q_abs.dtype, device=q_abs.device)
     quat_candidates = quat_by_rijk / (2.0 * q_abs[..., None].max(flr))
 
-    # if not for numerical problems, quat_candidates[i] should be same (up to a sign),
-    # forall i; we pick the best-conditioned one (with the largest denominator)
+    # all candidates agree up to sign and numerics, pick the best-conditioned one (largest
+    # denominator)
     indices = q_abs.argmax(dim=-1, keepdim=True)
     expand_dims = list(batch_dim) + [1, 4]
     gather_indices = indices.unsqueeze(-1).expand(expand_dims)
@@ -110,15 +109,7 @@ def matrix_to_quaternion(matrix: torch.Tensor) -> torch.Tensor:
 
 
 def build_covariance(scale: torch.Tensor, rotation_xyzw: torch.Tensor) -> torch.Tensor:
-    """Build a covariance matrix from scale and rotation.
-
-    Args:
-        scale (torch.Tensor): scale of shape (..., 3).
-        rotation_xyzw (torch.Tensor): rotation as quaternion of shape (..., 4) in (x, y, z, w) format.
-
-    Returns:
-        torch.Tensor: covariance matrix of shape (..., 3, 3).
-    """
+    """Covariance matrices (..., 3, 3) of scales (..., 3) and xyzw quaternions (..., 4)."""
     scale = scale.diag_embed()
     rotation = quaternion_to_matrix(rotation_xyzw)
     return (

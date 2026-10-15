@@ -23,8 +23,11 @@ Author: Alexander Veicht
 """
 
 import argparse
+import urllib.request
 import zipfile
 from pathlib import Path
+
+import pandas as pd
 
 from splatfactory import get_logger
 from splatfactory.datasets.scripts.utils import (
@@ -51,16 +54,12 @@ META_CSV_URL = "https://raw.githubusercontent.com/DL3DV-10K/Dataset/main/cache/D
 
 def fetch_metadata(cache_dir: Path):
     """Fetch DL3DV metadata CSV (cached). Returns pandas DataFrame."""
-    import urllib.request
-
     cache_dir.mkdir(parents=True, exist_ok=True)
     csv_path = cache_dir / "DL3DV-valid.csv"
 
     if not csv_path.exists():
         logger.info(f"Downloading metadata CSV -> {csv_path}")
         urllib.request.urlretrieve(META_CSV_URL, csv_path)
-
-    import pandas as pd
 
     return pd.read_csv(csv_path)
 

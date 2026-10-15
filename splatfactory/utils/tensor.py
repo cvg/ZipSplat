@@ -78,6 +78,15 @@ class TensorWrapper(TensorClass, tensor_only=True):
     def device(self) -> torch.device:
         return self.data_.device
 
+    def backward(self, gradient: "TensorWrapper") -> None:
+        """Backpropagate a gradient into the graph that produced the wrapped tensor.
+
+        Args:
+            gradient: Gradient with respect to this wrapper, of the same type and shape (e.g. the
+                `.grad` of a detached leaf copy).
+        """
+        self.data_.backward(gradient.data_)
+
     def __deepcopy__(self, memo: Dict[int, Any]) -> "TensorWrapper":
         # The tensorclass __deepcopy__ will be deprecated, so we clone instead.
         return self.clone()
@@ -111,11 +120,12 @@ class TensorWrapper(TensorClass, tensor_only=True):
                 result_data = torch.cat(data_list, *args[1:], **(kwargs or {}))
                 return cls(result_data)
 
-        # Handle torch.stack for tensordict 0.9.0 compatibility
+        # Handle torch.stack like torch.cat above: stack the underlying tensors directly.
+        # Delegating to tensordict.stack recurses on tensordict >= 0.13, which calls
+        # torch.stack internally and re-enters this handler.
         if func.__name__ == "stack" and args and isinstance(args[0], list):
-            if hasattr(args[0][0], "_tensordict"):
-                from tensordict import stack as td_stack
-
-                return td_stack(args[0], *args[1:], **(kwargs or {}))
+            if all(isinstance(x, cls) for x in args[0]):
+                data_list = [x.data_ for x in args[0]]
+                return cls(torch.stack(data_list, *args[1:], **(kwargs or {})))
 
         return getattr(cls, func.__name__)(*args, **(kwargs or {}))

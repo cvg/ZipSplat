@@ -3,6 +3,7 @@
 Author: Alexander Veicht
 """
 
+import random
 from abc import ABC, abstractmethod
 
 from omegaconf import DictConfig, OmegaConf
@@ -39,8 +40,18 @@ class BaseViewSampler(ABC):
 
         self.split = split
         self.is_overfitting = self.conf.is_overfitting
+        # "random" (training) | "min" | "max": pin the context gap to an extreme (probes only)
+        self.gap_mode = "random"
 
         self._init(self.conf)
+
+    def draw_gap(self, min_gap: int, max_gap: int) -> int:
+        """Context gap in [min_gap, max_gap]: uniform, or pinned by `gap_mode`."""
+        if self.gap_mode == "min":
+            return min_gap
+        if self.gap_mode == "max":
+            return max_gap
+        return random.randint(min_gap, max_gap)
 
     @abstractmethod
     def _init(self, conf):
@@ -63,8 +74,13 @@ class BaseViewSampler(ABC):
         num_context_views: int | None = None,
         num_target_views: int | None = None,
         total_num_views: int | None = None,
+        scene: dict | None = None,
     ):
-        """Returns a dict with keys: context_indices, target_indices, overlap_scores"""
+        """Dict of context_indices, target_indices and overlap_scores.
+
+        `scene` is the raw scene dict, for samplers that read per-scene data such as the
+        covisibility rankings.
+        """
         raise NotImplementedError
 
     @property

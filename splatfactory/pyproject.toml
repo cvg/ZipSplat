@@ -17,6 +17,15 @@ dynamic = ["dependencies"]
 xformers = ["xformers"]
 # interactive plotly/dash figure server (splatfactory.visualization.viz3d.show_figure).
 viz = ["dash"]
+# interactive viser viewer (python -m splatfactory.visualization.scene_viewer). nerfview imports
+# splines without declaring it.
+viewer = ["viser", "nerfview", "splines"]
+# dataset preparation: DA3 depth (datasets/scripts/extract_depth.py) and the ScanNet++ mesh
+# depth (datasets/scripts/scannetpp/convert.py)
+data = [
+    "depth-anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3.git",
+    "open3d",
+]
 dev = ["black==23.9.1", "flake8", "isort==5.12.0"]
 
 # pyproject lives inside the package dir (mirrors GeoCalib's siclib/). Discover subpackages relative

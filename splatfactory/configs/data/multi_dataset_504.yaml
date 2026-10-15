@@ -1,0 +1,165 @@
+# Multi-dataset mix of the 504 px finetune: DA3-native 504 long edge, AnySplat-style dataset
+# coverage + RE10K.
+#
+# Aspect ratios are W/H of the training crop, drawn once per batch from the child's list.
+# Seven presets at long edge 504 (W x H): 1.8 = 504x280 (16:9), 1.5 = 504x336 (3:2),
+# 1.333 = 504x378 (4:3), 1.0 = 504x504, 0.75 = 378x504 (3:4), 0.667 = 336x504 (2:3),
+# 0.556 = 280x504 (9:16). A child only lists presets its source covers WITHOUT upscaling
+# (source W >= crop W and source H >= crop H).
+name: composed
+seed: 0
+
+val_batch_size: 1
+batch_size: 384
+num_workers: 8
+prefetch_factor: 2
+
+image_num_range: [2, 24]
+aspect_ratios: [1.0]
+zoom_range: [0.8, 1.0]  # per-scene center zoom crop, clamped per source so nothing is upscaled
+num_target_views: 4
+random_reference_view: true
+use_relative_poses: true
+normalize_baseline: false
+near: 0.1
+far: 100.0
+# Default for children that do not set it. Off: it would skip ~27% of ScanNet++ windows
+# (irregular capture motion, not shot cuts). The video walkthroughs turn it on per child.
+max_pose_jump_ratio: 0
+
+preprocessing: &preprocessing
+  resize: 504
+  edge_divisible_by: 14
+
+# Weights = share of scene draws (one sample per draw, small sets are oversampled by shard
+# repetition). Visits per scene per 1M samples: RE10K 0.8, DL3DV 32, ScanNet++ 117/94,
+# ARKitScenes 29, Hypersim 75, Unreal 250, BlendedMVS 189, CO3D 44, WildRGB-D 4, GObjaverse 0.2.
+childs:
+  # --- video walkthroughs: frame-gap sampler, trained gaps -------------------------------
+  re10k:
+    dataset_dir: data/re10k/360x640
+    dataset_name: re10k
+    weight: 0.05  # easy and already solved by the init checkpoint, kept as a small floor
+    aspect_ratios: [1.8, 1.5]  # 360x640 source: H < 378 rules out 4:3, 1:1 and portrait
+    preprocessing: *preprocessing
+    max_pose_jump_ratio: 10.0
+    view_sampler:
+      name: bounded
+      warm_up_steps: 0
+      min_distance_between_context_views: 35
+      gap_multiplier: 45
+      max_distance_between_consecutive_views: 90
+
+  dl3dv:
+    dataset_dir: data/dl3dv/540x960
+    dataset_name: dl3dv
+    weight: 0.32
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    max_pose_jump_ratio: 10.0
+    view_sampler:
+      name: bounded
+      warm_up_steps: 0
+      min_distance_between_context_views: 8
+      initial_min_distance_between_context_views: 5
+      gap_multiplier: 11
+      max_distance_between_consecutive_views: 22
+
+  # --- room scans / indoor trajectories: pose-rank sampler --------------------------------
+  scannetpp_dslr:
+    dataset_dir: data/scannetpp_v2/720x1080
+    dataset_name: scannetpp
+    weight: 0.10
+    train_shard_dir: ${.dataset_dir}/dslr/train-scenes
+    test_shard_dir: ${.dataset_dir}/dslr/test-scenes
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    # Covisibility window: every sampled view shares >= min_overlap with the reference,
+    # the far context view is drawn from [min_overlap, max_overlap] (hard = min, easy = max).
+    view_sampler: &rank_sampler
+      name: rank
+      min_overlap: 0.2
+      max_overlap: 0.8
+
+  scannetpp_iphone:
+    dataset_dir: data/scannetpp_v2/720x1080
+    dataset_name: scannetpp
+    weight: 0.08
+    train_shard_dir: ${.dataset_dir}/iphone/train-scenes
+    test_shard_dir: ${.dataset_dir}/iphone/test-scenes
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    view_sampler: *rank_sampler
+
+  # Videos are rotated upright at convert time (Apple sky_direction): two trees, one per
+  # orientation. Weights split by video count (Up+Down 2732 / Left+Right 2335 of 5067).
+  arkitscenes_landscape:
+    dataset_dir: data/arkitscenes/480x640
+    dataset_name: arkitscenes
+    weight: 0.07
+    aspect_ratios: [1.8, 1.5, 1.333]  # 480x640 source: H < 504 rules out 1:1 and portrait
+    preprocessing: *preprocessing
+    view_sampler: *rank_sampler
+
+  arkitscenes_portrait:
+    dataset_dir: data/arkitscenes/640x480
+    dataset_name: arkitscenes
+    weight: 0.06
+    aspect_ratios: [0.75, 0.667, 0.556]  # 640x480 source: W < 504 rules out 1:1 and landscape
+    preprocessing: *preprocessing
+    view_sampler: *rank_sampler
+
+  hypersim:
+    dataset_dir: data/ml-hypersim/768x1024
+    dataset_name: hypersim
+    weight: 0.05
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    view_sampler: *rank_sampler
+
+  # --- scattered game viewpoints: overlap sampler ----------------------------------------
+  unrealstereo4k:
+    dataset_dir: data/unrealstereo4k/540x960
+    dataset_name: unrealstereo4k
+    weight: 0.02  # only 8 environments (80 chunks), exposure flicker between frames
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    view_sampler: *rank_sampler
+
+  # --- object / 360 captures: every view sees the object, random context ------------------
+  blendedmvs:
+    dataset_dir: data/blendedmvs/576x768
+    dataset_name: blendedmvs
+    weight: 0.02  # 113 scenes, the only aerial / large-scale content
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]
+    preprocessing: *preprocessing
+    view_sampler:
+      name: random
+
+
+  co3d:
+    dataset_dir: data/co3d/720s
+    dataset_name: co3d
+    weight: 0.1
+    aspect_ratios: [1.0, 0.75, 0.667, 0.556]  # portrait phone orbits (W 720 x H ~1230)
+    preprocessing: *preprocessing
+    view_sampler:
+      name: random
+
+  wildrgbd:
+    dataset_dir: data/wildrgbd/640x480
+    dataset_name: wildrgbd
+    weight: 0.08
+    aspect_ratios: [0.75, 0.667, 0.556]  # W 480 x H 640 source: W < 504 rules out landscape and 1:1
+    preprocessing: *preprocessing
+    view_sampler:
+      name: random
+
+  gobjaverse:
+    dataset_dir: data/gobjaverse/512x512
+    dataset_name: gobjaverse
+    weight: 0.05
+    aspect_ratios: [1.8, 1.5, 1.333, 1.0, 0.75, 0.667, 0.556]  # 512x512 renders cover all
+    preprocessing: *preprocessing
+    view_sampler:
+      name: random

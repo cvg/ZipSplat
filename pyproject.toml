@@ -21,12 +21,13 @@ dynamic = ["dependencies"]
 [project.optional-dependencies]
 # xformers' fused SwiGLU kernel the DA3-Giant checkpoint was trained with (optional speedup).
 xformers = ["xformers"]
-# interactive viser viewer (python -m zipsplat.viewer)
-viewer = ["viser", "nerfview"]
+# interactive viser viewer (python -m zipsplat.viewer). nerfview imports splines without
+# declaring it.
+viewer = ["viser", "nerfview", "splines"]
 dev = ["black==23.9.1", "flake8", "isort==5.12.0"]
 
 [tool.setuptools]
-packages = ["zipsplat"]
+packages = ["zipsplat", "zipsplat.kernels"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
@@ -39,6 +40,7 @@ exclude = "(venv/|docs/|third_party/)"
 profile = "black"
 line_length = 100
 atomic = true
+known_first_party = ["splatfactory", "zipsplat", "experiments"]
 
 [tool.flake8]
 max-line-length = 100

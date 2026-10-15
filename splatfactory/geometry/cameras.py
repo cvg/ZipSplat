@@ -25,9 +25,7 @@ class Camera(TensorWrapper):
 
     @classmethod
     def from_colmap(cls, camera: Union[Dict, NamedTuple]) -> "Camera":
-        """Camera from a COLMAP Camera tuple or dictionary.
-        We use the corner-convetion from COLMAP (center of top left pixel is (0.5, 0.5))
-        """
+        """Camera from a COLMAP camera tuple or dict, top-left pixel centre at (0.5, 0.5)."""
         if isinstance(camera, tuple):
             camera = camera._asdict()
 
@@ -60,12 +58,13 @@ class Camera(TensorWrapper):
 
     @classmethod
     def from_fov(cls, fov_x: torch.Tensor, fov_y: torch.Tensor, w: int, h: int) -> "Camera":
-        """Create camera from vertical field of view and image size.
+        """Camera from the fields of view and the image size, principal point at the centre.
 
         Args:
-            fov_w: vertical field of view in radians, shape (...,).
-            w: image width, shape (...,).
-            h: image height, shape (...,).
+            fov_x: Horizontal field of view in radians (...,).
+            fov_y: Vertical field of view in radians (...,).
+            w: Image width.
+            h: Image height.
         """
         w = fov_x.new_full(fov_x.shape, w) if isinstance(w, int) else w
         h = fov_y.new_full(fov_y.shape, h) if isinstance(h, int) else h
@@ -90,8 +89,10 @@ class Camera(TensorWrapper):
         cx, cy = new_K[..., 0, 2], new_K[..., 1, 2]
 
         t = new_t_img.to(self.data_)
-        w = self.w * t[..., 0, 0] + 2 * t[..., 0, 2]
-        h = self.h * t[..., 1, 1] + 2 * t[..., 1, 2]
+        # per-view w/h: self.w/self.h strip batch dims to a scalar, which fails to
+        # stack with per-view fx/fy/cx/cy for multi-view cameras.
+        w = self.size[..., 0] * t[..., 0, 0] + 2 * t[..., 0, 2]
+        h = self.size[..., 1] * t[..., 1, 1] + 2 * t[..., 1, 2]
         newdata_ = torch.stack([w, h, fx, fy, cx, cy], -1)
 
         alldata_ = torch.cat([newdata_, self.dist], -1)
@@ -187,7 +188,6 @@ class Camera(TensorWrapper):
     def in_image(self, p2d: torch.Tensor):
         """Check if 2D points are within the image boundaries."""
         assert p2d.shape[-1] == 2
-        # assert p2d.shape[:-2] == self.shape  # allow broadcasting
         size = self.size.unsqueeze(-2)
         valid = torch.all((p2d >= 0) & (p2d <= (size - 1)), -1)
         return valid
@@ -250,19 +250,14 @@ class Camera(TensorWrapper):
 
     @autocast
     def normalize(self, p2d: torch.Tensor) -> torch.Tensor:
-        """Convert normalized 2D coordinates into pixel coordinates."""
+        """Convert pixel coordinates into normalized 2D coordinates."""
         return (p2d - self.c.unsqueeze(-2)) / self.f.unsqueeze(-2)
 
     def J_denormalize(self):
         return torch.diag_embed(self.f).unsqueeze(-3)  # 1 x 2 x 2
 
     def pixel_coordinates(self) -> torch.Tensor:
-        """Pixel coordinates in camera frame [0, w-1] x [0, h-1].
-
-        Returns:
-            torch.Tensor: Pixel coordinates as a tensor of shape (..., h*w, 2)
-                        where ... are the leading batch dimensions of the cameras.
-        """
+        """Pixel coordinates [..., H * W, 2] in [0, w - 1] x [0, h - 1]."""
         w, h = self.w.round().long(), self.h.round().long()
 
         # Create a pixel grid of shape (h*w, 2)
@@ -280,25 +275,14 @@ class Camera(TensorWrapper):
         return xy
 
     def normalized_image_coordinates(self) -> torch.Tensor:
-        """Normalized image coordinates in camera frame [-1, 1] x [-1, 1].
-
-        Returns:
-            torch.Tensor: Normalized image coordinates as a tensor of shape (B, h * w, 3).
-        """
+        """Homogeneous normalized camera coordinates (x, y, 1) of all pixels [..., H * W, 3]."""
         xy = self.pixel_coordinates()
         uv1, _ = self.image2world(xy)
         return uv1
 
     @autocast
     def unproject_depth(self, depth: torch.Tensor) -> torch.Tensor:
-        """Unproject depth map into 3D points in camera frame.
-
-        Args:
-            depth (torch.Tensor): Depth map as a tensor of shape (..., H, W).
-
-        Returns:
-            torch.Tensor: 3D points as a tensor of shape (..., H, W, 3).
-        """
+        """Camera-frame points [..., H, W, 3] of a depth map [..., H, W]."""
         w, h = self.w.round().long(), self.h.round().long()
         assert depth.shape[-2:] == (h, w), f"Depth shape {depth.shape[-2:]} != {(h, w)}."
 
@@ -308,14 +292,7 @@ class Camera(TensorWrapper):
 
     @autocast
     def pixel_bearing_many(self, p3d: torch.Tensor) -> torch.Tensor:
-        """Get the bearing vectors of pixel coordinates.
-
-        Args:
-            p2d (torch.Tensor): Pixel coordinates as a tensor of shape (..., 3).
-
-        Returns:
-            torch.Tensor: Bearing vectors as a tensor of shape (..., 3).
-        """
+        """Unit bearing vectors [..., 3] of camera-frame points [..., 3]."""
         return F.normalize(p3d, dim=-1)
 
     @autocast
@@ -329,11 +306,9 @@ class Camera(TensorWrapper):
 
     @autocast
     def image2world(self, p2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Transform point in the image plane to 3D world coordinates."""
+        """Homogeneous normalized camera coordinates [..., 3] of pixels [..., 2], and validity."""
         p2d = self.normalize(p2d)
         p2d, valid = self.undistort(p2d)
-        # ones = p2d.new_ones(p2d.shape[:-1] + (1,))
-        # p3d = torch.cat([p2d, ones], -1)
         p3d = to_homogeneous(p2d)
         return p3d, valid
 

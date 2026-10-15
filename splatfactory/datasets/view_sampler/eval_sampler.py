@@ -30,6 +30,7 @@ class EvalViewSampler(BaseViewSampler):
         num_context_views: int | None = None,
         num_target_views: int | None = None,
         total_num_views: int | None = None,
+        scene: dict | None = None,
     ):
         """Returns a dict with keys: context_indices, target_indices, overlap_scores"""
 

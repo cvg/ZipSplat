@@ -25,7 +25,8 @@ def get_overlap_tag(overlap):
 
 
 class RE10KBenchmark(MultiViewBenchmark):
-    # context view count -> shipped eval index (select with `--views`)
+    # context view count -> eval index (select with `eval.num_views`). The YoNoSplat 6-view
+    # protocol with 8 targets.
     INDICES = {6: "splatfactory/eval/indices/re10k/ctx_6v_tgt_8v.json"}
     default_conf = {
         "data": {

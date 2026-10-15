@@ -1,16 +1,14 @@
-"""Composed dataset - combines multiple datasets with weighted sampling.
+"""Composed dataset: several datasets mixed by weight.
 
-Inherits from MultiViewDataset. Pools shards from all children, oversamples smaller
-datasets so effective scene counts match configured weight ratios. Each shard is
-tagged with its source child, and per-child view_sampler/preprocessor/dataset_name
-are passed explicitly to the parent's scene processing.
-
-Adding a new dataset requires only a config change.
+Pools the shards of all children and oversamples the smaller ones so the scene draws match the
+configured weights. Each child keeps its own view sampler, preprocessing and aspect ratios.
+Adding a dataset to the mix is a config change.
 
 Author: Alexander Veicht
 """
 
 import json
+import math
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -20,11 +18,11 @@ from omegaconf import OmegaConf
 
 from splatfactory import get_logger
 from splatfactory.datasets.augmentations import get_augmentation
-from splatfactory.datasets.multi_view_dataset import MultiViewDataset
+from splatfactory.datasets.multi_view_dataset import MultiViewDataset, resolve_shard_paths
 from splatfactory.datasets.utils import io, workers
 from splatfactory.datasets.view_sampler import BaseViewSampler, get_view_sampler
 from splatfactory.utils.image import ImagePreprocessor
-from splatfactory.utils.tools import StepTimer
+from splatfactory.utils.timing import StepTimer
 
 logger = get_logger(__name__)
 
@@ -40,14 +38,12 @@ class _ChildSource:
     preprocessor: ImagePreprocessor = field(repr=False)
     weight: float = 1.0
     num_scenes: int = 0
+    aspect_ratios: list[float] = field(default_factory=lambda: [1.0])
+    max_pose_jump_ratio: float = 0.0
 
 
 class ComposedDataset(MultiViewDataset):
-    """Shard dataset combining multiple shard sources with weighted sampling.
-
-    Each tagged shard carries its child index; the child's view_sampler and
-    preprocessor are passed to the parent's _process_scene per scene.
-    """
+    """Shard dataset combining several children with weighted sampling."""
 
     base_default_conf = {
         **MultiViewDataset.base_default_conf,
@@ -56,6 +52,8 @@ class ComposedDataset(MultiViewDataset):
         "train_shard_dir": ".",
         "test_shard_dir": ".",
         "childs": {},
+        "samples_per_epoch": None,  # train: global scenes per epoch, split over ranks x workers
+        "val_samples": None,  # val: global scenes per pass, a fixed subset
     }
 
     def _init(self, conf, split: str = "train") -> None:
@@ -77,12 +75,12 @@ class ComposedDataset(MultiViewDataset):
         dataset_dir = Path(child_conf.dataset_dir)
         default_dir = dataset_dir / ("train-scenes" if split == "train" else "test-scenes")
         dir_key = "train_shard_dir" if split == "train" else "test_shard_dir"
-        shard_dir = Path(child_conf.get(dir_key, str(default_dir)))
-        shards = sorted(shard_dir.glob("shard-*.tar"))
+        raw_dir = child_conf.get(dir_key, str(default_dir))
+        shards = resolve_shard_paths(raw_dir)
         if not shards:
-            raise FileNotFoundError(f"No shards for '{label}' in {shard_dir}")
+            raise FileNotFoundError(f"No shards for '{label}' in {raw_dir}")
 
-        num_scenes = self._count_scenes(shard_dir)
+        num_scenes = self._count_scenes(raw_dir)
         vs_conf = child_conf.view_sampler
         view_sampler = get_view_sampler(vs_conf.name)(vs_conf, split=split)
         aug_conf = child_conf.get("augmentations", {"name": "identity"})
@@ -91,7 +89,7 @@ class ComposedDataset(MultiViewDataset):
             child_conf.get("preprocessing", {}), augmentation=augmentation
         )
 
-        logger.info(f"[{split}] {label}: {num_scenes} scenes in {len(shards)} shards ({shard_dir})")
+        logger.info(f"[{split}] {label}: {num_scenes} scenes in {len(shards)} shards ({raw_dir})")
         return _ChildSource(
             name=label,
             dataset_name=child_conf.get("dataset_name", label),
@@ -100,22 +98,35 @@ class ComposedDataset(MultiViewDataset):
             preprocessor=preprocessor,
             weight=child_conf.get("weight", 1.0),
             num_scenes=num_scenes,
+            aspect_ratios=[
+                float(a) for a in child_conf.get("aspect_ratios", self.conf.aspect_ratios)
+            ],
+            max_pose_jump_ratio=float(
+                child_conf.get("max_pose_jump_ratio", self.conf.max_pose_jump_ratio)
+            ),
         )
 
     @staticmethod
-    def _count_scenes(shard_dir: Path) -> int:
-        """Count scenes from index.json (fast) or by scanning tars (slow fallback)."""
-        index_path = shard_dir / "index.json"
-        if index_path.exists():
-            with open(index_path) as f:
-                return len(json.load(f))
-        count = sum(
-            1
-            for tar in sorted(shard_dir.glob("shard-*.tar"))
-            for _ in io.iter_scenes_from_tar(str(tar))
-        )
-        logger.warning(f"No index.json in {shard_dir}, counted {count} scenes by scanning")
-        return count
+    def _count_scenes(shard_dirs) -> int:
+        """Scenes in one or several shard directories, from index.json or by scanning tars."""
+        if isinstance(shard_dirs, (str, Path)):
+            shard_dirs = [shard_dirs]
+        total = 0
+        for d in shard_dirs:
+            d = Path(str(d))
+            index_path = d / "index.json"
+            if index_path.exists():
+                with open(index_path) as f:
+                    total += len(json.load(f))
+                continue
+            count = sum(
+                1
+                for tar in sorted(d.glob("shard-*.tar"))
+                for _ in io.iter_scenes_from_tar(str(tar))
+            )
+            logger.warning(f"No index.json in {d}, counted {count} scenes by scanning")
+            total += count
+        return total
 
     def _build_weighted_pool(self) -> list[tuple[Path, int]]:
         """Repeat shard lists so effective scene counts match weight ratios.
@@ -154,8 +165,12 @@ class ComposedDataset(MultiViewDataset):
         wid, num_workers = workers.get_dataloader_worker_info()
 
         tagged = self._tagged_shards[rank::world_size][wid::num_workers]
+        total = self.conf.samples_per_epoch if self.split == "train" else self.conf.val_samples
         if self.split == "train":
             random.Random(self.seed + self._epoch + wid).shuffle(tagged)
+        elif total:
+            random.Random(self.seed + wid).shuffle(tagged)  # same val subset every pass
+        cap = math.ceil(total / (world_size * num_workers)) if total else self.conf.max_samples
 
         logger.info(
             f"[rank={rank}/{world_size}, worker={wid}/{num_workers}] "
@@ -174,14 +189,30 @@ class ComposedDataset(MultiViewDataset):
         yielded = 0
         skipped = 0
         stream = tagged_scene_stream()
+        pending = None  # scene of another child that closed the previous batch
 
         while True:
-            vc, ar, bs = self._sample_batch_params(batch_rng, is_train)
+            vc, _, bs = self._sample_batch_params(batch_rng, is_train)
 
-            batch = []
+            # One child per batch: the aspect ratio comes from the child's preset list, and a
+            # scene from another child closes the batch early and opens the next one.
+            batch, batch_child, ar = [], None, None
             self.step_timer.reset()
-            for raw_scene, child in stream:
+            while True:
+                if pending is not None:
+                    raw_scene, child = pending
+                    pending = None
+                else:
+                    raw_scene, child = next(stream, (None, None))
+                    if raw_scene is None:
+                        break
                 self.step_timer.measure("tar_io")
+                if batch_child is None:
+                    batch_child = child
+                    ar = float(batch_rng.choice(child.aspect_ratios))
+                elif child is not batch_child:
+                    pending = (raw_scene, child)
+                    break
                 if not self._scene_ok(raw_scene, vc, view_sampler=child.view_sampler):
                     self.step_timer.reset()
                     continue
@@ -193,6 +224,7 @@ class ComposedDataset(MultiViewDataset):
                         view_sampler=child.view_sampler,
                         preprocessor=child.preprocessor,
                         dataset_name=child.dataset_name,
+                        max_pose_jump_ratio=child.max_pose_jump_ratio,
                     )
                     sample["dataset"] = child.name
                     batch.append(sample)
@@ -204,11 +236,13 @@ class ComposedDataset(MultiViewDataset):
                     break
 
             if not batch:
-                break
+                if pending is None:
+                    break  # stream exhausted
+                continue  # every scene of this child was skipped, start on the pending one
 
             yield workers.collate(batch)
             yielded += len(batch)
-            if self.conf.max_samples is not None and yielded >= self.conf.max_samples:
+            if cap is not None and yielded >= cap:
                 break
 
         if skipped > 0:

@@ -1,11 +1,11 @@
 """TensorWrapper base for batched per-tensor packed types (Camera, Pose, Gaussians),
-plus shared utilities (k-means clustering, image loading).
+plus image loading and resizing.
 
 Author: Alexander Veicht
 """
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import imageio.v2 as imageio
 import numpy as np
@@ -14,11 +14,10 @@ from PIL import Image
 
 
 class TensorWrapper:
-    """Single-tensor wrapper. Subclasses pack their parameters into a ``[..., D]`` tensor and
-    expose named views over the trailing dimension; all leading dimensions are batch dims.
+    """Single-tensor wrapper: subclasses pack their parameters into a (..., D) tensor.
 
-    The leading ``data_.shape[:-1]`` is the batch shape (``self.shape``). Indexing, dtype/device
-    moves, and ``torch.cat`` / ``torch.stack`` operate on the batch dims and rewrap the result.
+    The leading dims are the batch shape (`self.shape`). Indexing, dtype and device moves, and
+    `torch.cat` / `torch.stack` act on them and rewrap the result.
     """
 
     data_: torch.Tensor
@@ -69,6 +68,35 @@ class TensorWrapper:
     def detach(self) -> "TensorWrapper":
         return self.__class__(self.data_.detach())
 
+    def float(self) -> "TensorWrapper":
+        return self.__class__(self.data_.float())
+
+    def expand(self, *shape: int) -> "TensorWrapper":
+        """Expand the batch dims (-1 keeps a dim)."""
+        return self.__class__(self.data_.expand(*shape, -1))
+
+    def reshape(self, *shape: int) -> "TensorWrapper":
+        """Reshape the batch dims."""
+        return self.__class__(self.data_.reshape(*shape, self.data_.shape[-1]))
+
+    # ------------------------- autograd -------------------------
+
+    @property
+    def requires_grad(self) -> bool:
+        return self.data_.requires_grad
+
+    def requires_grad_(self, requires_grad: bool = True) -> "TensorWrapper":
+        self.data_.requires_grad_(requires_grad)
+        return self
+
+    @property
+    def grad(self) -> Optional["TensorWrapper"]:
+        return None if self.data_.grad is None else self.__class__(self.data_.grad)
+
+    def backward(self, gradient: "TensorWrapper") -> None:
+        """Backpropagate a gradient of the same type and shape into the wrapped tensor."""
+        self.data_.backward(gradient.data_)
+
     # ------------------------- torch dispatch -------------------------
 
     @classmethod
@@ -89,54 +117,14 @@ class TensorWrapper:
         return str(self)
 
 
-def kmeans(
-    x: torch.Tensor, K: int, n_iters: int = 5, chunk_size: int = 2048
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Hard k-means with chunked distance computation (memory-efficient).
+def add_batch_dim(data: dict) -> dict:
+    """Add a batch dimension to every element of data."""
+    return {k: v[None] for k, v in data.items()}
 
-    Uses chunked cdist + scatter_add to avoid materializing full [N, K] matrices.
-    Peak memory: O(chunk x K) instead of O(N x K). Centroids are uniformly initialized
-    via linspace over the input tokens.
 
-    Args:
-        x: [B, N, D] input features.
-        K: number of clusters.
-        n_iters: number of iterations (converges in 2-3; 5 leaves headroom).
-        chunk_size: tokens per chunk for the distance computation.
-
-    Returns:
-        centroids: [B, K, D].
-        nearest_idx: [B, K] index of the nearest original token per centroid.
-        assignments: [B, N] cluster assignment per token from the last iteration.
-    """
-    B, N, D = x.shape
-    idx = torch.linspace(0, N - 1, K, device=x.device).round().long().unsqueeze(0).expand(B, -1)
-    batch_idx = torch.arange(B, device=x.device).unsqueeze(1).expand(-1, K)
-    centroids = x[batch_idx, idx]
-    ones = torch.ones(B, N, 1, device=x.device, dtype=x.dtype)
-
-    for _ in range(n_iters):
-        assignments = torch.empty(B, N, dtype=torch.long, device=x.device)
-        for s in range(0, N, chunk_size):
-            e = min(s + chunk_size, N)
-            dists = torch.cdist(x[:, s:e], centroids)
-            assignments[:, s:e] = dists.argmin(dim=-1)
-            del dists
-
-        new_centroids = torch.zeros_like(centroids)
-        new_centroids.scatter_add_(1, assignments.unsqueeze(-1).expand(-1, -1, D), x)
-        counts = torch.zeros(B, K, 1, device=x.device, dtype=x.dtype)
-        counts.scatter_add_(1, assignments.unsqueeze(-1), ones)
-        centroids = new_centroids / counts.clamp(min=1)
-
-    nearest_idx = torch.empty(B, K, dtype=torch.long, device=x.device)
-    for s in range(0, K, chunk_size):
-        e = min(s + chunk_size, K)
-        dists = torch.cdist(centroids[:, s:e], x)
-        nearest_idx[:, s:e] = dists.argmin(dim=-1)
-        del dists
-
-    return centroids, nearest_idx, assignments
+def remove_batch_dim(data: dict) -> dict:
+    """Remove the batch dimension from every element of data."""
+    return {k: v[0] for k, v in data.items()}
 
 
 def load_image(path: Path) -> torch.Tensor:
@@ -197,11 +185,7 @@ def resize_image(image: torch.Tensor, h: int, w: int) -> torch.Tensor:
 
 
 def crop_to_ar(image: torch.Tensor, ar: float) -> torch.Tensor:
-    """Center-crop image (..., 3, H, W) to aspect ratio `ar` (= w/h).
-
-    ar > 1 = landscape, ar < 1 = portrait, ar = 1 = square.
-    Whichever dimension exceeds the target is cropped; never resizes.
-    """
+    """Centre-crop an image (..., 3, H, W) to the aspect ratio `ar` = w / h, without resizing."""
     H, W = image.shape[-2:]
     target_w = round(H * ar)
     if target_w <= W:
@@ -226,14 +210,14 @@ def to_square(image: torch.Tensor, size: int = IMAGE_SIZE) -> torch.Tensor:
 
 
 def chw_from_hwc(x):
-    """...HWC → ...CHW (works on numpy arrays and torch tensors)."""
+    """...HWC -> ...CHW (works on numpy arrays and torch tensors)."""
     if isinstance(x, np.ndarray):
         return np.moveaxis(x, -1, -3)
     return x.transpose(-2, -1).transpose(-3, -2)
 
 
 def hwc_from_chw(x):
-    """...CHW → ...HWC (works on numpy arrays and torch tensors)."""
+    """...CHW -> ...HWC (works on numpy arrays and torch tensors)."""
     if isinstance(x, np.ndarray):
         return np.moveaxis(x, -3, -1)
     return x.transpose(-3, -2).transpose(-2, -1)

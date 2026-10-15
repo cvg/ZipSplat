@@ -2,8 +2,8 @@
 
 Reads `.torch` files directly from re10k.zip (pixelSplat/MVSplat format).
 Each `.torch` contains ~12 scenes with (N, 18) RE10K cameras and raw JPEG images.
-Passes JPEG bytes through unchanged when --target-size is omitted; otherwise
-re-encodes as WebP lossless after crop+resize.
+Without --target-size the JPEG bytes pass through unchanged, with it the frames are cropped,
+resized and re-encoded as lossless WebP.
 
 Usage:
     python -m splatfactory.datasets.scripts.re10k.convert
