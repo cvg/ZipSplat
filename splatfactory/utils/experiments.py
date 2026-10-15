@@ -6,9 +6,12 @@ Author: Paul-Edouard Sarlin (skydes)
 Adapted from gluefactory (https://github.com/cvg/glue-factory), Apache-2.0.
 """
 
+import gzip
 import os
 import re
 import shutil
+import socket
+import time
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Optional
@@ -267,9 +270,6 @@ def tensorboard_trace_handler(
     ``worker_name`` should be unique for each worker in distributed scenario,
     it will be set to '[hostname]_[pid]' by default.
     """
-    import os
-    import socket
-    import time
 
     def file_replace(filepath, pattern, target):
         # Read in the file
@@ -303,8 +303,6 @@ def tensorboard_trace_handler(
         file_replace(file_path, '"user_annotation', '"cpu_op')
 
         if use_gzip:
-            import gzip
-
             with open(file_path, "rb") as fin:
                 with gzip.open(file_path + ".gz", "wb") as fout:
                     fout.writelines(fin)

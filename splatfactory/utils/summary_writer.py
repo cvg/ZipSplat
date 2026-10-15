@@ -9,6 +9,7 @@ from typing import Any, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly
 import torch
 from omegaconf import DictConfig, OmegaConf
 from sklearn.metrics import auc, average_precision_score, precision_recall_curve, roc_auc_score
@@ -216,6 +217,44 @@ class SummaryWriter:
 
         if self.use_tensorboard:
             self.writer.close()
+
+
+def write_dict_summaries(writer, name: str, items: dict, step: int):
+    for k, v in items.items():
+        key = f"{name}/{k}"
+        if isinstance(v, dict):
+            writer.add_scalars(key, v, step=step)
+        elif isinstance(v, tuple):
+            writer.add_pr_curve(f"pr/{key}", *v, step=step)
+        else:
+            writer.add_scalar(key, v, step=step)
+
+
+def write_image_summaries(writer, name: str, figures: Sequence[Any], step: int):
+    # Stacked grayscale is not supported, convert to RGB!
+    def _add_plot(tag, fig_or_image, step):
+        if isinstance(fig_or_image, (np.ndarray, torch.Tensor)):
+            if fig_or_image.ndim in (2, 3):
+                writer.add_image(tag, fig_or_image, step)
+            else:
+                assert fig_or_image.ndim == 4
+                writer.add_images(tag, fig_or_image, step)
+        elif isinstance(fig_or_image, plt.Figure):
+            # Figure or list[Figure]
+            writer.add_figure(tag, fig_or_image, step)
+            plt.close(fig_or_image)
+        elif isinstance(fig_or_image, plotly.graph_objs.Figure):
+            writer.add_plotly(tag, fig_or_image, step)
+        else:
+            raise ValueError(f"Unsupported figure or image type: {type(fig_or_image)}")
+
+    if isinstance(figures, list):
+        for i, figs in enumerate(figures):
+            for k, fig in figs.items():
+                _add_plot(f"{name}/{i}_{k}", fig, step)
+    else:
+        for k, fig in figures.items():
+            _add_plot(f"{name}/{k}", fig, step)
 
 
 if __name__ == "__main__":

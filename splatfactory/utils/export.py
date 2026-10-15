@@ -22,6 +22,7 @@ def export_predictions(
     optional_keys=[],
     callback_fn=None,
     mode="w",
+    batch_extras=None,
 ):
     assert keys == "*" or isinstance(keys, (tuple, list))
     Path(output_file).parent.mkdir(exist_ok=True, parents=True)
@@ -31,7 +32,8 @@ def export_predictions(
     hfile = h5py.File(str(output_file), mode)
     for data_ in tqdm(loader, desc="Export", ncols=100):
         data = mappings.batch_to_device(data_, device, non_blocking=True)
-        pred = model(data)
+        # Merged after the device move so plain python flags never reach batch_to_device.
+        pred = model({**data, **batch_extras} if batch_extras else data)
         if callback_fn is not None:
             pred = {**callback_fn(pred, data), **pred}
 

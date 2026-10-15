@@ -108,15 +108,16 @@ def resize_context(data: dict, target_size: int) -> dict:
 
 
 def resize_to_cover(image, target_h, target_w, method: str = "torch_bilinear_aa"):
-    """Uniformly scale so both dims >= target. Preserves aspect ratio.
+    """Scale uniformly so both sides reach the target, keeping the aspect ratio.
 
     Args:
-        image: HWC uint8 numpy or CHW float torch tensor.
-        target_h, target_w: minimum output dimensions.
-        method: "pil_lanczos" (default), "torch_bilinear_aa", or "cv2_inter_area".
+        image: HWC uint8 numpy array or CHW float tensor.
+        target_h: Minimum output height.
+        target_w: Minimum output width.
+        method: "torch_bilinear_aa" (default), "pil_lanczos" or "cv2_inter_area".
 
     Returns:
-        (image, transform): resized image, 3x3 scale matrix.
+        The resized image and its 3x3 scale matrix.
     """
     h, w = _get_hw(image)
     scale = max(target_h / h, target_w / w)
@@ -151,18 +152,17 @@ def resize_to_cover(image, target_h, target_w, method: str = "torch_bilinear_aa"
 
 
 def crop_to_principal_point(image, cx, cy):
-    """Crop largest rectangle with principal point at center, preserving original AR.
+    """Largest crop with the input's aspect ratio that centres the principal point.
 
-    The crop is the largest sub-image where (cx, cy) maps to the exact center,
-    with the same aspect ratio as the input. Even dimensions guarantee no
-    off-by-one on the principal point.
+    Even sides keep the principal point exactly at the centre.
 
     Args:
-        image: HWC numpy or CHW torch tensor.
-        cx, cy: principal point in pixel coordinates.
+        image: HWC numpy array or CHW tensor.
+        cx: Principal point x in pixels.
+        cy: Principal point y in pixels.
 
     Returns:
-        (image, transform): cropped image, 3x3 translation matrix.
+        The cropped image and its 3x3 translation matrix.
     """
     h, w = _get_hw(image)
     ar = w / h
@@ -197,17 +197,14 @@ def crop_to_principal_point(image, cx, cy):
 
 
 def crop_to_ar(image, aspect_ratio):
-    """Center-crop to match target aspect ratio (W/H).
-
-    ar > 1 = landscape, ar < 1 = portrait, ar = 1 = square.
-    Crops whichever dimension exceeds the target AR.
+    """Centre-crop to the aspect ratio W / H.
 
     Args:
-        image: HWC numpy or CHW torch tensor.
-        aspect_ratio: target W/H ratio.
+        image: HWC numpy array or CHW tensor.
+        aspect_ratio: Target W / H, above 1 for landscape.
 
     Returns:
-        (image, transform): cropped image, 3x3 translation matrix.
+        The cropped image and its 3x3 translation matrix.
     """
     h, w = _get_hw(image)
     target_w = _round_even(h * aspect_ratio)
@@ -238,17 +235,26 @@ def crop_to_ar(image, aspect_ratio):
     return cropped, transform
 
 
-def crop_to_divisible(image, divisor):
-    """Center-crop edges to nearest multiple of divisor.
+def _center_crop(a, s):
+    """Symmetric centre crop (crop, x0, y0) of an HW[C] array to at least `s` of its size.
 
-    Removes at most (divisor - 1) pixels per edge. Never resizes.
+    The margins are equal on both sides, since Camera.compose_image_transform derives the new
+    size as size - 2 * offset.
+    """
+    h, w = a.shape[:2]
+    y0, x0 = int((h - h * s) // 2), int((w - w * s) // 2)
+    return a[y0 : h - y0, x0 : w - x0], x0, y0
+
+
+def crop_to_divisible(image, divisor):
+    """Centre-crop both sides down to a multiple of `divisor`, without resizing.
 
     Args:
-        image: HWC numpy or CHW torch tensor.
-        divisor: integer divisor.
+        image: HWC numpy array or CHW tensor.
+        divisor: Integer divisor.
 
     Returns:
-        (image, transform): cropped image, 3x3 translation matrix.
+        The cropped image and its 3x3 translation matrix.
     """
     h, w = _get_hw(image)
     h_new = h // divisor * divisor
@@ -275,19 +281,12 @@ def crop_to_divisible(image, divisor):
 
 
 def resize_depth(depth, target_hw, invalid_value=-1.0):
-    """Resize a depth map with proper invalid pixel handling.
-
-    Invalid pixels (< 0) are set to NaN before resize so they propagate
-    through INTER_AREA averaging. Any output pixel whose source region
-    overlaps an invalid pixel becomes invalid.
+    """Resize a depth map (H, W) with INTER_AREA, invalid wherever an invalid pixel contributes.
 
     Args:
-        depth: (H, W) float32 numpy array, negative = invalid.
-        target_hw: (H_target, W_target).
-        invalid_value: value for invalid pixels in output.
-
-    Returns:
-        (H_target, W_target) float32 numpy array.
+        depth: Depth (H, W) as float32 numpy array, negative values are invalid.
+        target_hw: Output size (H, W).
+        invalid_value: Value of the invalid output pixels.
     """
     h_target, w_target = target_hw
     d = depth.astype(np.float32).copy()
@@ -301,16 +300,7 @@ def resize_depth(depth, target_hw, invalid_value=-1.0):
 
 
 def read_image(path, grayscale=False, as_tensor=False):
-    """Read an image from disk.
-
-    Args:
-        path: file path.
-        grayscale: read as grayscale.
-        as_tensor: if True, return CHW float32 tensor; else HWC uint8 numpy.
-
-    Returns:
-        HWC uint8 numpy array, or CHW float32 tensor if as_tensor=True.
-    """
+    """Image from disk as HWC uint8 numpy array, or CHW float32 tensor with `as_tensor`."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"No image at path {path}.")
@@ -344,28 +334,25 @@ class ImageNetNormalizer(nn.Module):
 
 
 class ImagePreprocessor:
-    """Chains: resize_to_cover -> crop_to_ar -> crop_to_divisible -> [augment] -> to_tensor.
+    """resize_to_cover, crop_to_ar, crop_to_divisible, optional augmentation, to_tensor.
 
-    Pipeline operates on numpy uint8 throughout, converts to tensor at the end.
-    Uses cv2.INTER_AREA for downscaling (fast, accurate box filter on uint8).
-    Depth follows the same spatial ops with nearest interpolation.
-    All spatial ops compose into a single 3x3 transform for camera intrinsics update.
-
-    conf.resize = long edge of the final output (before divisible crop).
-    aspect_ratio is passed at call time (W/H).
+    Works on uint8 numpy arrays and converts to a tensor at the end. Depth and masks follow the
+    same spatial steps with nearest interpolation, and the steps compose into one 3x3
+    transform for the intrinsics. `conf.resize` is the long edge of the output, the aspect
+    ratio is passed per call.
     """
 
     default_conf = {
         "resize": None,  # long edge of output, None for no resize
         "edge_divisible_by": None,  # crop to nearest multiple
-        "resize_method": "torch_bilinear_aa",  # "torch_bilinear_aa" or "pil_lanczos"
+        "resize_method": "torch_bilinear_aa",  # or "pil_lanczos", "cv2_inter_area"
     }
 
     def __init__(self, conf, augmentation=None):
         """
         Args:
-            conf: OmegaConf or dict with preprocessing config.
-            augmentation: optional callable (HWC uint8 numpy -> HWC uint8 numpy).
+            conf: Preprocessing config, OmegaConf or dict.
+            augmentation: Optional HWC uint8 to HWC uint8 callable.
         """
         default_conf = OmegaConf.create(self.default_conf)
         if isinstance(conf, dict):
@@ -373,13 +360,16 @@ class ImagePreprocessor:
         self.conf = OmegaConf.merge(default_conf, conf)
         self.augmentation = augmentation
 
-    def __call__(self, image, depth=None, aspect_ratio=1.0):
-        """Preprocess an image (and optional depth map).
+    def __call__(self, image, depth=None, mask=None, aspect_ratio=1.0, zoom=1.0):
+        """Preprocess an image (and optional depth map / binary mask).
 
         Args:
-            image: HWC uint8 numpy array. If CHW float tensor, converted to numpy first.
-            depth: (H, W) float32 numpy or tensor, optional. Values < 0 are invalid.
-            aspect_ratio: target W/H ratio. 1.0 = square.
+            image: HWC uint8 numpy array, or a CHW float tensor converted first.
+            depth: Optional depth (H, W), negative values are invalid.
+            mask: Optional binary mask (H, W), nonzero is True.
+            aspect_ratio: Target W / H, 1.0 for square.
+            zoom: Centre-crop factor below 1 zooms in, clamped so nothing is upscaled. 1.0
+                is off.
 
         Returns:
             dict with:
@@ -387,6 +377,7 @@ class ImagePreprocessor:
                 "transform": (3, 3) float64 ndarray
                 "depth": (H, W) float32 tensor (if depth provided)
                 "depth_mask": (H, W) bool tensor (if depth provided)
+                "mask": (H, W) bool tensor (if mask provided)
         """
         if isinstance(image, torch.Tensor):
             image = to_numpy(image)
@@ -397,7 +388,27 @@ class ImagePreprocessor:
             depth = depth.astype(np.float32).copy()
             depth[depth < 0] = np.nan
 
+        if mask is not None:
+            if isinstance(mask, torch.Tensor):
+                mask = mask.detach().cpu().numpy()
+            mask = (np.asarray(mask) > 0).astype(np.uint8)
+
         transform = np.eye(3)
+
+        # 0. Zoom: center crop by s = max(zoom, smallest crop that still covers the target)
+        if zoom < 1.0 and self.conf.resize is not None:
+            h, w = image.shape[:2]
+            target_h, target_w = self._compute_target(aspect_ratio)
+            s = max(zoom, target_h / h, target_w / w)
+            if s < 1.0:
+                image, x0, y0 = _center_crop(image, s)
+                if depth is not None:
+                    depth = _center_crop(depth, s)[0]
+                if mask is not None:
+                    mask = _center_crop(mask, s)[0]
+                t = np.eye(3)
+                t[0, 2], t[1, 2] = -x0, -y0
+                transform = t @ transform
 
         # 1. Resize to cover target dimensions
         if self.conf.resize is not None:
@@ -407,6 +418,9 @@ class ImagePreprocessor:
             if depth is not None:
                 h, w = image.shape[:2]
                 depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+            if mask is not None:
+                h, w = image.shape[:2]
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
         # 2. Crop to target AR
         image, t = crop_to_ar(image, aspect_ratio)
@@ -417,6 +431,12 @@ class ImagePreprocessor:
             if dh != h or dw != w:
                 cy, cx = int(-t[1, 2]), int(-t[0, 2])
                 depth = depth[cy : cy + h, cx : cx + w]
+        if mask is not None:
+            h, w = image.shape[:2]
+            mh, mw = mask.shape
+            if mh != h or mw != w:
+                cy, cx = int(-t[1, 2]), int(-t[0, 2])
+                mask = mask[cy : cy + h, cx : cx + w]
 
         # 3. Crop to divisible
         if self.conf.edge_divisible_by is not None:
@@ -428,6 +448,12 @@ class ImagePreprocessor:
                 if dh != h or dw != w:
                     cy, cx = int(-t[1, 2]), int(-t[0, 2])
                     depth = depth[cy : cy + h, cx : cx + w]
+            if mask is not None:
+                h, w = image.shape[:2]
+                mh, mw = mask.shape
+                if mh != h or mw != w:
+                    cy, cx = int(-t[1, 2]), int(-t[0, 2])
+                    mask = mask[cy : cy + h, cx : cx + w]
 
         # 4. Color augmentation (on uint8, after spatial)
         if self.augmentation is not None:
@@ -444,6 +470,9 @@ class ImagePreprocessor:
             depth_tensor = torch.from_numpy(np.ascontiguousarray(depth)).float()
             result["depth"] = depth_tensor
             result["depth_mask"] = depth_tensor > 0
+
+        if mask is not None:
+            result["mask"] = torch.from_numpy(np.ascontiguousarray(mask)) > 0
 
         return result
 
