@@ -14,34 +14,7 @@ from torch import Tensor, nn
 
 from splatfactory.models.modules.attention import CrossAttention, SelfAttention
 from splatfactory.models.modules.drop_path import DropPath
-from splatfactory.models.modules.misc import LayerScale
-
-
-class Mlp(nn.Module):
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: Optional[int] = None,
-        out_features: Optional[int] = None,
-        act_layer: Callable[..., nn.Module] = nn.GELU,
-        drop: float = 0.0,
-        bias: bool = True,
-    ) -> None:
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+from splatfactory.models.modules.misc import LayerScale, Mlp
 
 
 def drop_add_residual_stochastic_depth(
@@ -181,7 +154,8 @@ class CrossAttentionBlock(nn.Module):
         super().__init__()
 
         self.norm_q = norm_layer(dim)
-        self.norm_kv = norm_layer(dim)
+        self.norm_k = norm_layer(dim)
+        self.norm_v = norm_layer(dim)
 
         self.attn = CrossAttention(
             dim,
@@ -212,24 +186,27 @@ class CrossAttentionBlock(nn.Module):
 
     def forward(
         self,
-        queries: Tensor,
-        context: Tensor,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
         return_attention: bool = False,
         return_delta: bool = False,
+        residual: Tensor = None,
     ) -> Tensor:
-        """
-        Standard mode (default): returns queries + attn_delta + mlp_delta - the full block with
-        the outer residual add, i.e. the standard transformer block output.
+        """Pre-norm cross-attention block: query + attn_delta + mlp_delta.
 
-        `return_delta=True`: returns ONLY attn_delta + mlp_delta, without adding queries back.
-        The MLP sub-block still operates on (queries + attn_delta) so its non-linearity sees a
-        valid post-attention state, but only the sum of the two deltas is returned. Used by
-        ZipSplat to inject a layer's CA contribution into a separate scene_tokens stream while
-        using queries_l only as the attention query source (not as the residual anchor).
+        Args:
+            query: [B, N_q, D] queries, also the residual anchor unless `residual` is given.
+            key: [B, N_c, D] keys, token-aligned with `value`.
+            value: [B, N_c, D] values.
+            return_attention: also return the head-averaged attention map.
+            return_delta: return only attn_delta + mlp_delta, without the residual.
+            residual: residual anchor replacing `query`.
         """
         attn_result = self.attn(
-            self.norm_q(queries),
-            self.norm_kv(context),
+            self.norm_q(query),
+            self.norm_k(key),
+            self.norm_v(value),
             return_attention=return_attention,
         )
         if return_attention:
@@ -238,7 +215,7 @@ class CrossAttentionBlock(nn.Module):
             attn_out = attn_result
 
         attn_delta = self.drop_path1(self.ls1(attn_out))
-        post_attn = queries + attn_delta
+        post_attn = (query if residual is None else residual) + attn_delta
         mlp_delta = self.drop_path2(self.ls2(self.mlp(self.norm2(post_attn))))
 
         if return_delta:

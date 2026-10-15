@@ -6,7 +6,8 @@ defaults:
   - _self_
 
 model:
-  weights: zipsplat  # full released model (backbone included), auto-downloaded from Hugging Face
+  # full released 252 px model (backbone included), auto-downloaded from Hugging Face
+  weights: https://huggingface.co/veichta/zipsplat/resolve/main/zipsplat-da3g-252.tar
   skip_head_render: true
   backbone:
     weights: null  # skip the DA3 training-init weights; the released checkpoint provides them

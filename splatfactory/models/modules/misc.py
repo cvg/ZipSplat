@@ -1,14 +1,10 @@
-"""Various modules used in the decoder of the model.
+"""Small shared modules: LayerScale, Mlp, ZipSplat's color embedding and token merge."""
 
-Adapted from https://github.com/jinlinyi/PerspectiveFields
-"""
-
-from typing import Union
+from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor, nn
 
 from splatfactory import get_logger
@@ -31,93 +27,76 @@ class LayerScale(nn.Module):
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 
-class DWConv(nn.Module):
-    def __init__(self, dim=768):
-        super(DWConv, self).__init__()
-        self.dwconv = nn.Conv2d(dim, dim, 3, 1, 1, bias=True, groups=dim)
+class Mlp(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: Optional[int] = None,
+        out_features: Optional[int] = None,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        drop: float = 0.0,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias)
+        self.drop = nn.Dropout(drop)
 
-    def forward(self, x):
-        x = self.dwconv(x)
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
         return x
 
 
-class ConvModule(nn.Module):
-    """Replacement for mmcv.cnn.ConvModule to avoid mmcv dependency."""
+class ColorEmbedMLP(nn.Module):
+    """Per-patch MLP (patchify Conv2d, GELU, Linear) from RGB patches to color tokens.
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        padding: int = 0,
-        use_norm: bool = False,
-        bias: bool = True,
-    ):
+    Args:
+        patch_size: Patch size in pixels.
+        in_chans: Input channels.
+        embed_dim: Output token dimension.
+    """
+
+    def __init__(self, patch_size, in_chans, embed_dim):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=bias)
-        self.bn = nn.BatchNorm2d(out_channels) if use_norm else nn.Identity()
-        self.activate = nn.ReLU(inplace=True)
+        self.proj1 = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.act = nn.GELU()
+        self.proj2 = nn.Linear(embed_dim, embed_dim)
 
     def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        return self.activate(x)
+        """[(B V), 3, H, W] -> [(B V), T, embed_dim]."""
+        x = self.proj1(x).flatten(2).transpose(1, 2)
+        return self.proj2(self.act(x))
 
 
-class ResidualConvUnit(nn.Module):
-    """Residual convolution module."""
+class TokenMerge(nn.Module):
+    """Merge N token streams into one: sum_i LS_i(MLP_i(LN_i(t_i))).
 
-    def __init__(self, features):
-        """Init.
-        Args:
-            features (int): number of features
-        """
+    Each stream has its own LayerNorm, a 2-layer MLP (hidden = dim) and a LayerScale gate
+    initialized at 1 / N, so the merge starts as an average.
+
+    Args:
+        dim: Token dimension of every stream.
+        num_streams: Number of merged streams.
+    """
+
+    def __init__(self, dim, num_streams):
         super().__init__()
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_streams)])
+        self.projs = nn.ModuleList([Mlp(dim, hidden_features=dim) for _ in range(num_streams)])
+        self.gates = nn.ModuleList(
+            [LayerScale(dim, init_values=1 / num_streams) for _ in range(num_streams)]
+        )
 
-        self.conv1 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True)
-        self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True)
-
-        self.relu = torch.nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        """Forward pass.
-        Args:
-            x (tensor): input
-        Returns:
-            tensor: output
-        """
-        out = self.relu(x)
-        out = self.conv1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        return out + x
-
-
-class FeatureFusionBlock(nn.Module):
-    """Feature fusion block."""
-
-    def __init__(self, features, unit2only=False, upsample=True):
-        """Init.
-        Args:
-            features (int): number of features
-        """
-        super().__init__()
-        self.upsample = upsample
-
-        if not unit2only:
-            self.resConfUnit1 = ResidualConvUnit(features)
-        self.resConfUnit2 = ResidualConvUnit(features)
-
-    def forward(self, *xs):
-        """Forward pass."""
-        output = xs[0]
-
-        if len(xs) == 2:
-            output = output + self.resConfUnit1(xs[1])
-
-        output = self.resConfUnit2(output)
-
-        if self.upsample:
-            output = F.interpolate(output, scale_factor=2, mode="bilinear", align_corners=False)
-
-        return output
+    def forward(self, tokens):
+        """List of N [..., dim] tensors -> [..., dim]."""
+        out = 0
+        for norm, proj, gate, t in zip(self.norms, self.projs, self.gates, tokens):
+            out = out + gate(proj(norm(t)))
+        return out
