@@ -341,7 +341,7 @@ repo root:
 # single GPU
 python -m splatfactory.train zipsplat --conf zipsplat
 # multiple GPUs on one node
-torchrun --nproc_per_node=4 -m splatfactory.train zipsplat --conf zipsplat --distributed
+torchrun --nproc_per_node=4 -m splatfactory.train zipsplat --conf zipsplat
 ```
 
 `zipsplat` is the experiment name (checkpoints are written to `outputs/training/zipsplat/`), use any
@@ -359,7 +359,7 @@ To log training to [TensorBoard](https://www.tensorflow.org/tensorboard) or
 [Weights & Biases](https://wandb.ai), set `train.writer`:
 
 ```bash
-torchrun --nproc_per_node=4 -m splatfactory.train zipsplat --conf zipsplat --distributed train.writer=tensorboard
+torchrun --nproc_per_node=4 -m splatfactory.train zipsplat --conf zipsplat train.writer=tensorboard
 ```
 
 The trained model can then be evaluated by its experiment name (see [Evaluation](#evaluation)):

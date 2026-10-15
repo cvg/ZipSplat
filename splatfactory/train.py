@@ -11,19 +11,16 @@ import datetime
 import logging
 import os
 import shutil
-import sys
-import time
 from pathlib import Path
-from typing import Sequence
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
-from splatfactory import __module_name__, get_logger, logger, settings, trainer
+from splatfactory import get_logger, logger, settings, trainer
 from splatfactory.utils import experiments, stdout_capturing, tools
-from splatfactory.utils.distributed import get_distributed_env, is_torchrun_launch
+from splatfactory.utils.distributed import get_distributed_env
 
 # Logger for init messages that should appear on all ranks
 init_logger = get_logger(__name__, level=logging.INFO)
@@ -181,20 +178,6 @@ def main_worker(conf, output_dir, args):
     return res
 
 
-def save_code_snapshot(
-    output_dir: Path,
-    extra_module_names: Sequence[str] = (),
-    compression: str | None = "zip",
-):
-    """Create a snapshot of the codebase."""
-    for module in [__module_name__] + list(extra_module_names):
-        mod_dir = Path(__import__(str(module)).__file__).parent
-        if compression:
-            shutil.make_archive(output_dir / module, compression, mod_dir)
-        else:
-            shutil.copytree(mod_dir, output_dir / module, dirs_exist_ok=True)
-
-
 def parse_args():
     """Parse command line arguments and return them."""
     parser = argparse.ArgumentParser()
@@ -228,150 +211,13 @@ def parse_args():
         help="Create an ablation folder (/XID) that increments on each run",
     )
     parser.add_argument(
-        "--compress_snapshot",
-        "--cs",
-        type=str,
-        default="zip",
-    )
-    parser.add_argument(
         "--sweep_idx", "-sid", type=int, default=None, help="Index of the sweep run"
     )
     parser.add_argument("--quiet", action="store_true", help="Mute some logging")
-    parser.add_argument("--distributed", action="store_true", help="Run in distributed mode")
     parser.add_argument("--strict", action="store_true", help="Strict config merge")
     parser.add_argument("dotlist", nargs="*")
     args = parser.parse_intermixed_args()
     return args
-
-
-def setup_experiment_distributed(args, env):
-    """
-    Setup experiment directory and config for distributed training.
-
-    In multi-node SLURM jobs, only the first task (SLURM_PROCID=0) creates
-    the directory and saves code. Other tasks wait for setup to complete.
-
-    Returns:
-        tuple: (output_dir, conf) where output_dir is Path and conf is DictConfig
-    """
-
-    slurm_procid = int(os.environ.get("SLURM_PROCID", "0"))
-    slurm_nodeid = int(os.environ.get("SLURM_NODEID", "0"))
-    is_first_task = slurm_procid == 0
-
-    logger.info(
-        f"Setup: Task PROCID={slurm_procid}, NODEID={slurm_nodeid}, "
-        f"is_first_task={is_first_task}"
-    )
-
-    if is_first_task:
-        # Only first task creates directory and saves code
-        logger.info("Task 0: Setting up experiment directory and config")
-        output_dir = create_training_dir(args.experiment, args)
-        conf = compose_cli_config(output_dir, args)
-
-        # Detect GPU count
-        conf.train.num_devices = conf.train.get("num_devices", 0)
-        if conf.train.num_devices < 1:
-            conf.train.num_devices = torch.cuda.device_count()
-            assert conf.train.num_devices > 0, "No GPUs found for distributed training"
-
-        # Save code snapshot
-        save_code_snapshot(
-            output_dir,
-            conf.train.get("submodules", ()),
-            compression=args.compress_snapshot,
-        )
-
-        # Signal to other tasks that setup is done
-        setup_done_file = output_dir / ".setup_done"
-        setup_done_file.touch()
-        logger.info(f"Task 0: Setup complete, created {output_dir}")
-    else:
-        # Other tasks wait for first task to finish setup
-        output_dir = settings.TRAINING_PATH / args.experiment
-        setup_done_file = output_dir / ".setup_done"
-
-        logger.info(f"Task {slurm_procid}: Waiting for task 0 to complete setup...")
-        max_wait = 300  # 5 minutes
-        waited = 0
-        while not setup_done_file.exists() and waited < max_wait:
-            time.sleep(1)
-            waited += 1
-
-        if not setup_done_file.exists():
-            raise RuntimeError(
-                f"Task {slurm_procid}: Timed out waiting for task 0 to setup directory"
-            )
-
-        logger.info(f"Task {slurm_procid}: Setup complete, loading config")
-
-        # Load config created by first task
-        conf = compose_cli_config(output_dir, args)
-
-        # Each task independently detects its GPU count
-        conf.train.num_devices = conf.train.get("num_devices", 0)
-        if conf.train.num_devices < 1:
-            conf.train.num_devices = torch.cuda.device_count()
-            assert conf.train.num_devices > 0, "No GPUs found for distributed training"
-
-    # Pass output_dir to spawned torchrun processes
-    os.environ["SPLATFACTORY_OUTPUT_DIR"] = str(output_dir)
-
-    return output_dir, conf
-
-
-def build_torchrun_command(args, conf):
-    """Build torchrun command for distributed training.
-
-    Args:
-        args: Parsed command-line arguments
-        conf: Resolved configuration
-
-    Returns:
-        List of command arguments for os.execvp()
-    """
-
-    # Get distributed environment settings
-    # CRITICAL: Read from SLURM first, fall back to config
-    num_nodes = int(os.environ.get("SLURM_NNODES", conf.train.get("num_nodes", 1)))
-    node_rank = int(os.environ.get("SLURM_NODEID", "0"))
-    master_addr = os.environ.get("MASTER_ADDR", "localhost")
-    master_port = os.environ.get("MASTER_PORT", "29500")
-
-    logger.info(
-        f"Torchrun config: num_nodes={num_nodes}, node_rank={node_rank}, "
-        f"nproc_per_node={conf.train.num_devices}, "
-        f"master={master_addr}:{master_port}"
-    )
-
-    # Build base torchrun command
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--nproc_per_node",
-        str(conf.train.num_devices),
-        "--nnodes",
-        str(num_nodes),
-        "--node_rank",
-        str(node_rank),
-        "--master_addr",
-        master_addr,
-        "--master_port",
-        master_port,
-        "-m",
-        "splatfactory.train",
-    ]
-
-    # Forward all original arguments except --distributed (already handled by torchrun)
-    # This is more robust than manually reconstructing - won't break when adding new args
-    # Note: experiment name is already in sys.argv[1], so no need to add it separately
-    for arg in sys.argv[1:]:
-        if arg != "--distributed":
-            cmd.append(arg)
-
-    return cmd
 
 
 if __name__ == "__main__":
