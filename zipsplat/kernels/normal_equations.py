@@ -1,10 +1,8 @@
-"""Fused Triton normal-equations kernel for the photometric pose aligner (pose_aligner.py).
+"""Fused Triton kernel of the photometric aligner's Gauss-Newton normal equations.
 
-The 6-DOF Gauss-Newton normal equations reduce a [M, 6] per-pixel Jacobian (M ~ 190k pixels) to a
-[6, 6] Hessian + [6] gradient. As a GEMM this is a tiny output over a huge contraction (<5% GPU
-occupancy, ~14 ms). This kernel builds each pixel's image-warp Jacobian row on the fly and reduces
-to H, g across many blocks (~0.06 ms). Deterministic (partial buffers + sum, no atomics).
-analytic_normal_eq is None without Triton; the aligner then takes its block-split torch path.
+Builds each pixel's Jacobian row on the fly and reduces it to H = JtJ and g = Jtr across many
+blocks, without materialising J. Deterministic (partial sums, no atomics). Without Triton,
+`analytic_normal_eq` is None and the aligner uses its torch path (zipsplat/pose_aligner.py).
 """
 
 from __future__ import annotations
@@ -39,9 +37,11 @@ if _HAS_TRITON:
         NB,
         BLOCK: tl.constexpr,
     ):
-        """Build the per-pixel warp Jacobian row (interaction matrix x image gradient) on the fly
-        and reduce to H,g without materialising J. gx/gy/r are [N,3,M] (mask applied), dep is [N,M].
-        Explicit scalars (Triton supports neither list-comps nor list .append)."""
+        """Partial H and g of one view and pixel block.
+
+        gx, gy and r are [N, 3, M] with the mask applied, dep is [N, M]. Written with explicit
+        scalars, since Triton has no list comprehensions.
+        """
         n = tl.program_id(0)
         blk = tl.program_id(1)
         offs = blk * BLOCK + tl.arange(0, BLOCK)
@@ -185,8 +185,11 @@ if _HAS_TRITON:
         tl.store(gp_ptr + gb + 5, gg5)
 
     def analytic_normal_eq(gx, gy, r, depth, fxv, fyv, cxv, cyv, Hh, Ww, block: int = 1024):
-        """Fused H[B,V,6,6], g[B,V,6] for the analytic image-warp Jacobian (no J materialised).
-        gx,gy,r:[B,V,3,H,W] (mask applied); depth:[B,V,H,W]; intrinsics:[B,V]."""
+        """H [B, V, 6, 6] and g [B, V, 6] of the analytic photometric Jacobian.
+
+        gx, gy and r are [B, V, 3, H, W] with the mask applied, depth is [B, V, H, W] and the
+        intrinsics are [B, V].
+        """
         b, vv = gx.shape[:2]
         N, M = b * vv, Hh * Ww
         gxf = gx.reshape(N, 3, M).contiguous()
@@ -203,5 +206,5 @@ if _HAS_TRITON:
         _ane_kernel[(N, NB)](gxf, gyf, rf, depf, fxf, fyf, cxf, cyf, Hp, gp, M, Ww, NB, BLOCK=block)
         return Hp.sum(1).reshape(b, vv, 6, 6), gp.sum(1).reshape(b, vv, 6)
 
-else:  # pragma: no cover -- pose_aligner falls back to its block-split torch path
+else:  # pragma: no cover, the aligner falls back to its torch path
     analytic_normal_eq = None

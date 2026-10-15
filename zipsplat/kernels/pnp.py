@@ -1,20 +1,14 @@
-"""Whole-solver kernel for TokenBA's PnP camera update (see zipsplat/pnp.robust_pnp).
+"""Fused Triton kernel of TokenBA's PnP camera update (zipsplat/pnp.py).
 
-Per-view robust PnP is embarrassingly parallel, so the ENTIRE GNC-IRLS-LM solve runs as ONE
-Triton launch: one program per view (or per view-hypothesis under multi-start), the M
-correspondences streamed in BLOCK-sized chunks, the 6x6 normal equations accumulated in
-registers, the Cholesky solve and Rodrigues update unrolled as scalars. That replaces ~600
-tiny kernel launches with a single one (~40x); the JIT costs ~1 s and is disk-cached.
-
-Scope is the production fast path: pose-only, no focal column, no hinged residual, no
-per-point weights -- the cone-BA study ruled all three out. `_pnp_gnc_torch` is the
-equivalent pure-torch solver, used when Triton is unavailable and as the parity reference.
-
-Semantics (both paths): Cauchy IRLS under a graduated-non-convexity scale ladder, adaptive
-per-view Marquardt damping with accept/reject, behind-camera points masked out.
+The whole robust solve runs as one launch, one program per view hypothesis: Cauchy IRLS under a
+graduated non-convexity scale ladder, per-view Marquardt damping with accept / reject, and
+behind-camera points masked out. The first call compiles the kernel, which is cached on disk.
+`_pnp_gnc_torch` is the pure-torch twin, used without Triton.
 """
 
 from __future__ import annotations
+
+from typing import Sequence, Tuple
 
 import torch
 
@@ -147,7 +141,7 @@ if _HAS_TRITON:
                     w = tl.where(mask & (Zr > EPS), 1.0 / (1.0 + r2 / s2), 0.0)
                     x = X * zi
                     y = Y * zi
-                    # J rows (v, omega), closed form (see _pnp_gnc_torch)
+                    # Jacobian rows of the (v, omega) twist, closed form
                     ju0 = fx * zi
                     ju2 = -fx * x * zi
                     ju3 = -fx * x * y
@@ -186,8 +180,7 @@ if _HAS_TRITON:
                     g3 += tl.sum(w * (ju3 * ru + jv3 * rv))
                     g4 += tl.sum(w * (ju4 * ru + jv4 * rv))
                     g5 += tl.sum(w * (ju5 * ru + jv5 * rv))
-                # h01 stays 0 (ju1 = jv0 = 0 makes the (0,1) block cross-terms vanish
-                # only via ju/jv separation; kept explicit for clarity)
+                # h01 stays 0 since ju1 = jv0 = 0
 
                 # ---- solve (H + lam I) dx = -g, 6x6 Cholesky, unrolled --------
                 a00 = h00 + lam
@@ -241,8 +234,8 @@ if _HAS_TRITON:
                 kz = d5 / div
                 st = tl.sin(th)
                 ct = 1.0 - tl.cos(th)
-                # exp = I + sin(th) K + (1 - cos(th)) K^2; tiny th: div=1 keeps K = skew(d)
-                # unnormalized, so st=1 gives the first-order I + skew(d) exactly.
+                # exp = I + sin(th) K + (1 - cos(th)) K^2. For tiny th, K = skew(d) stays
+                # unnormalized and st = 1 gives the first-order I + skew(d).
                 st = tl.where(small, 1.0, st)
                 ct = tl.where(small, 0.0, ct)
                 e00 = 1.0 + ct * (-ky * ky - kz * kz)
@@ -320,8 +313,7 @@ if _HAS_TRITON:
 
 
 def _pnp_gnc_torch(R, t, f, c, pts, obs, scales, iters, damping):
-    """Pure-torch twin of the kernel: batched per-view GNC-IRLS-LM on the pixel reprojection
-    residual. Same accept/reject and damping schedule, so it is the parity reference."""
+    """Pure-torch twin of the kernel, with the same accept / reject and damping schedule."""
     V = pts.shape[0]
     eye = torch.eye(6, device=pts.device, dtype=pts.dtype)
     lam = torch.full((V,), damping, device=pts.device, dtype=pts.dtype)
@@ -370,19 +362,35 @@ def _pnp_gnc_torch(R, t, f, c, pts, obs, scales, iters, damping):
             valid = torch.where(ok[:, None], valid_new, valid)
             cost = torch.where(ok, cost_new, cost)
             lam = torch.where(ok, lam * 0.3, lam * 5.0).clamp(1e-6, 1e4)
-        # No early stop: a `.item()` convergence check is a host sync, and on this
-        # launch-bound loop the sync costs more than the iterations it would save.
+        # no early stop: its host sync costs more than the iterations it would save
     return R, t
 
 
-def pnp_gnc(R, t, f, c, pts, obs, scales=(64.0, 12.0, 4.0), iters=4, damping=1e-3, backend="auto"):
-    """Robust per-view PnP in the world->camera frame.
+def pnp_gnc(
+    R: torch.Tensor,
+    t: torch.Tensor,
+    f: torch.Tensor,
+    c: torch.Tensor,
+    pts: torch.Tensor,
+    obs: torch.Tensor,
+    scales: Sequence[float] = (64.0, 12.0, 4.0),
+    iters: int = 4,
+    damping: float = 1e-3,
+    backend: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Robust per-view PnP in the world-to-camera frame. Returns the refined (R, t).
 
-    R [V,3,3], t [V,3] initial w2c rotation/translation; f, c [V,2] intrinsics; pts [V,M,3]
-    world points; obs [M,2] the pixel each point should land on (shared across views, since
-    every view observes its own patch grid). Returns the refined (R, t); inputs are untouched.
-
-    backend: "auto" (Triton on CUDA, else torch) | "triton" | "torch".
+    Args:
+        R: Initial w2c rotations [V, 3, 3].
+        t: Initial w2c translations [V, 3].
+        f: Focal lengths [V, 2].
+        c: Principal points [V, 2].
+        pts: World points [V, M, 3].
+        obs: Pixel each point should project to [M, 2], shared across views.
+        scales: Robust-scale ladder in pixels, coarse to fine.
+        iters: IRLS iterations per scale.
+        damping: Initial Marquardt damping.
+        backend: "auto" (Triton on CUDA, else torch), "triton" or "torch".
     """
     use_triton = backend == "triton" or (backend == "auto" and _HAS_TRITON and pts.is_cuda)
     if backend == "triton" and not _HAS_TRITON:

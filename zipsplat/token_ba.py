@@ -1,21 +1,16 @@
 """TokenBA: test-time bundle adjustment of a ZipSplat prediction in token space.
 
-Self-supervised against the input views only: the input-view poses and the scene tokens are
-refined so the rendered input views match the images. The frozen GaussianHead maps the scene
-tokens to Gaussians and acts as a learned prior.
+Self-supervised on the input views: the scene tokens and the input poses are refined so the
+rendered views match the input images. The frozen GaussianHead decodes the tokens to Gaussians
+and acts as a learned prior.
 
 Steps:
-    1. Camera update. Robust multi-start PnP of every pose on the patch-Gaussian
-       correspondences (zipsplat/pnp.py), then a short photometric polish (PoseAligner)
-       that removes the sub-patch error.
-    2. Token update. One Adam step on the scene tokens under the fixed poses, L1 rendering
-       loss on the input views through the frozen decoder.
-    Steps 1-2 alternate until a camera update moves every pose less than `round_tol_deg`.
-    3. Joint refinement. Scene tokens AND poses (se3 deltas) in one optimizer until the loss
-       plateaus.
-
-The refinement runs under TF32 matmuls; the decoder's MLP body runs in fp16 (`half_decoder`),
-its readout always in fp32. Port of splatfactory/geometry/token_ba.py.
+    1. Camera update. Robust PnP of every input pose on the patch-Gaussian correspondences
+       (zipsplat/pnp.py), then a short photometric polish that removes the sub-patch error.
+    2. Token update. One Adam step on the scene tokens under the fixed poses, with the L1
+       rendering loss of the input views.
+    Steps 1 and 2 alternate until no camera update moves a pose by more than `round_tol_deg`.
+    3. Joint refinement. Scene tokens and pose deltas in one optimizer until the loss plateaus.
 
 Usage:
     ba = TokenBA(verbose=True)
@@ -39,12 +34,12 @@ from zipsplat.pnp import patch_correspondences, robust_pnp
 from zipsplat.pose import Pose
 from zipsplat.pose_aligner import PoseAligner
 
-PATCH_PX = 14
+PATCH_PX = 14  # side of a token's image patch in pixels
 
 
 @contextlib.contextmanager
 def tf32_matmuls():
-    """Scoped TF32 matmuls (the BA runs in TF32; the caller's setting is restored)."""
+    """TF32 matmuls inside the block, the previous precision restored after."""
     prev = torch.get_float32_matmul_precision()
     torch.set_float32_matmul_precision("high")
     try:
@@ -57,17 +52,17 @@ class TokenBA:
     """Bundle adjustment of the scene tokens and input poses through the frozen decoder.
 
     Args:
-        rounds: Cap on the camera / token alternation (it exits on round_tol_deg).
-        round_tol_deg: Stop the alternation once a camera update moves every pose less.
+        rounds: Cap on the camera / token alternation.
+        round_tol_deg: The alternation stops once no pose moves by more than this.
         token_lr: Adam lr of the token update.
         joint_steps: Cap on the joint refinement steps.
-        joint_window, joint_tol: The joint refinement exits when a `joint_window`-step block
-            improves the running loss by less than `joint_tol` (relative); None runs all
-            `joint_steps`.
-        joint_token_lr, joint_pose_lr: Adam lrs of the joint refinement.
-        half_decoder: Decode the head's MLP body in fp16 while optimizing (the readout stays
-            fp32). The returned Gaussians are always decoded in full precision.
-        verbose: Progress bars for the alternation and the joint refinement.
+        joint_window: Block length of the joint refinement's stopping test.
+        joint_tol: The joint refinement stops when a block lowers the mean loss by less than
+            this (relative). None runs all `joint_steps`.
+        joint_token_lr: Adam lr of the scene tokens in the joint refinement.
+        joint_pose_lr: Adam lr of the pose deltas in the joint refinement.
+        half_decoder: fp16 MLP body while optimizing, ~7% faster at no quality loss.
+        verbose: Progress bars.
     """
 
     def __init__(
@@ -113,14 +108,18 @@ class TokenBA:
         """Robust PnP on the patch correspondences, then the photometric polish.
 
         Args:
-            head, scene_tokens: The frozen GaussianHead and the scene tokens (1, K, D).
-            camera, pose, image: Input cameras and c2w poses (1, V), images (1, V, 3, H, W).
+            head: The frozen GaussianHead.
+            scene_tokens: Scene tokens (1, K, D).
+            camera: Input cameras (1, V).
+            pose: Current c2w input poses (1, V).
+            image: Input images (1, V, 3, H, W).
             assignments: Per-token cluster ids (1, V * T) of a compressed prediction.
-            encoder_camera, encoder_hw: The patch grid the tokens were read from, when it is
-                coarser than the images (default: the images' own grid).
+            encoder_camera: Cameras of the patch grid the tokens were read from, when it is
+                coarser than the images. Default: `camera`.
+            encoder_hw: Size of that patch grid. Default: the image size.
 
         Returns:
-            The refined c2w poses (1, V).
+            The refined c2w input poses (1, V).
         """
         gaussians = head(scene_tokens, half_mlp=self.half_decoder)
         pts, obs = patch_correspondences(
@@ -155,11 +154,14 @@ class TokenBA:
         pose: Pose,
         image: Tensor,
     ) -> Pose:
-        """Refine the scene tokens and poses jointly until the loss plateaus.
+        """Refine the scene tokens and input poses jointly until the loss plateaus.
 
-        Continues the alternation's optimizer (whose only group holds the scene tokens): the
-        token moments carry over and only the token lr changes. Returns the refined c2w poses
-        (1, V).
+        Reuses the alternation's optimizer, whose only group holds the scene tokens. The token
+        moments carry over and only the token lr changes, so the hand-off starts without a
+        fresh-Adam transient. The poses are refined as se3 deltas on top of `pose`.
+
+        Returns:
+            The refined c2w input poses (1, V).
         """
         pose0 = pose
         se3 = nn.Parameter(torch.zeros(*pose0.shape, 6, device=image.device))  # rot | trans
@@ -206,22 +208,27 @@ class TokenBA:
 
         Args:
             scene_tokens: Scene tokens (1, K, D) of the prediction.
-            head: The (frozen) GaussianHead that decoded them.
-            camera: Cameras (1, V) of the images.
-            pose: Initial c2w poses (1, V), in the Gaussians' frame (e.g. the predicted ones).
-            image: Input views (1, V, 3, H, W) in [0, 1].
+            head: The frozen GaussianHead that decoded them.
+            camera: Input cameras (1, V).
+            pose: Initial c2w input poses (1, V) in the Gaussians' frame.
+            image: Input images (1, V, 3, H, W) in [0, 1].
             assignments: Per-token cluster ids (1, V * T) of a compressed prediction.
-            encoder_camera, encoder_hw: The cameras and size of the patch grid the tokens were
-                read from, when the BA supervises at a higher resolution.
+            encoder_camera: Cameras of the patch grid the tokens were read from, when it is
+                coarser than the images.
+            encoder_hw: Size of that patch grid.
 
         Returns:
-            gaussians (1, N), poses (1, V) and scene_tokens (1, K, D), all refined.
+            gaussians: The refined Gaussians (1, N), decoded in full precision.
+            poses: The refined c2w input poses (1, V).
+            scene_tokens: The refined scene tokens (1, K, D).
         """
         assert image.dim() == 5 and image.shape[0] == 1, "expects batched B == 1"
         pose = pose.detach()
         grid = dict(assignments=assignments, encoder_camera=encoder_camera, encoder_hw=encoder_hw)
+        # the predictor runs under no_grad, the refinement needs gradients
         with tf32_matmuls(), torch.enable_grad():
-            # clone: .float() is a no-op on fp32 and Adam steps in place
+            # copy: .float() is a no-op on fp32 tokens and Adam steps in place, so the caller's
+            # tokens would change silently
             scene_tokens = nn.Parameter(scene_tokens.detach().float().clone())
             optimizer = torch.optim.Adam([scene_tokens], lr=self.token_lr)
             for _ in range(self.rounds):
@@ -233,6 +240,6 @@ class TokenBA:
                     break
             pose = self.joint_refinement(optimizer, head, scene_tokens, camera, pose, image)
 
-        with torch.no_grad():  # full-precision decode of the refined tokens
+        with torch.no_grad():
             gaussians = head(scene_tokens)
         return {"gaussians": gaussians, "poses": pose, "scene_tokens": scene_tokens.detach()}

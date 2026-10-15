@@ -3,7 +3,7 @@
 Vendored and trimmed from:
   - DINOv2 ViT ((c) Meta Platforms, Apache-2.0)
   - DA3 multi-view extensions and camera-prior encoder
-    ((c) 2025 ByteDance Ltd., Apache-2.0; Lin et al. "Depth Anything 3", 2025)
+    ((c) 2025 ByteDance Ltd., Apache-2.0, Lin et al. "Depth Anything 3", 2025)
 
 Includes the optional camera-prior encoder (`CameraEnc`) that injects pose + intrinsics as a token
 at the `alt_start` layer, replacing the model's learned camera token.
@@ -374,7 +374,7 @@ class DAV3Encoder(nn.Module):
         super().__init__()
         if vit_name not in _VARIANT_FACTORIES:
             raise ValueError(
-                f"Unknown vit_name={vit_name!r}; choose from {list(_VARIANT_FACTORIES)}"
+                f"Unknown vit_name={vit_name!r}, choose from {list(_VARIANT_FACTORIES)}"
             )
         self.backbone = _VARIANT_FACTORIES[vit_name](out_layers=out_layers, **vit_kwargs)
         self.embed_dim = self.backbone.embed_dim

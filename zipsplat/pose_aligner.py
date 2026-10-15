@@ -1,14 +1,10 @@
-"""Photometric pose alignment: coarse-to-fine trust-region Levenberg-Marquardt (TokenBA's polish).
+"""Photometric pose alignment by coarse-to-fine trust-region Levenberg-Marquardt, TokenBA's polish.
 
-Direct alignment linearises the residual r = render - target by brightness constancy. Moving the
-camera by a small twist xi = (rot | trans) moves pixel (u, v) at depth z by the interaction
-matrix d(u, v)/d(xi), so J = d r / d xi = -grad(I) . d(u, v)/d(xi) needs ONE forward render
-(RGB + expected depth) and no autograd. The normal equations H = JtJ, g = Jtr run in a fused
-Triton kernel (kernels.normal_equations) when Triton is available, else in a block-split torch
-reduction.
+Brightness constancy linearises r = render - target in the camera twist xi = (rot | trans):
+J = -grad(I) . d(u, v)/d(xi), from one RGB + depth render and no autograd. The normal equations
+run in a fused Triton kernel when available, else in torch.
 
-Trimmed from splatfactory/geometry/pose_aligner/ to what TokenBA uses (no gauge scan, no
-full-resolution guard). All image tensors are (B, V, C, H, W).
+The splatfactory aligner trimmed to what TokenBA uses. All image tensors are (B, V, C, H, W).
 
 Author: Alexander Veicht
 """
@@ -24,8 +20,8 @@ from zipsplat.gaussians import Gaussians
 from zipsplat.kernels import analytic_normal_eq
 from zipsplat.pose import Pose
 
-_ALPHA_EPS, _DEPTH_EPS = 1e-3, 1e-4  # a rendered pixel is valid if alpha and depth exceed these
-_BLOCK = 4096  # contraction block of the pure-torch normal equations
+_ALPHA_EPS, _DEPTH_EPS = 1e-3, 1e-4  # validity thresholds of a rendered pixel
+_BLOCK = 4096  # contraction block of the torch normal equations
 _DAMPING = 1e-3  # initial Marquardt lambda
 _MIN_STEP = 1e-4  # trust-region floor: below this a level is converged
 _blur_kernels: dict = {}
@@ -37,8 +33,7 @@ _blur_kernels: dict = {}
 
 
 def render_rgbd(gaussians: Gaussians, camera: Camera, pose: Pose, render_kw: Dict[str, Any]):
-    """RGB (B, V, 3, H, W), expected depth (B, V, 1, H, W) and the float mask of the pixels
-    whose alpha and depth are both above the validity thresholds."""
+    """RGB (B, V, 3, H, W), expected depth (B, V, 1, H, W) and the mask of valid pixels."""
     rendering, info = gaussians.render(camera, pose, mode="RGB+ED", **render_kw)
     rgb, depth = rendering[:, :, :3], rendering[:, :, 3:4]
     mask = ((info["alphas"] > _ALPHA_EPS) & (depth > _DEPTH_EPS)).to(rgb.dtype)
@@ -46,7 +41,7 @@ def render_rgbd(gaussians: Gaussians, camera: Camera, pose: Pose, render_kw: Dic
 
 
 def image_gradient(img: Tensor):
-    """Central-difference image gradient (d/du, d/dv) in pixels; zero on the border."""
+    """Central-difference image gradient (d/du, d/dv), zero on the border."""
     gx, gy = torch.zeros_like(img), torch.zeros_like(img)
     gx[..., 1:-1] = (img[..., 2:] - img[..., :-2]) * 0.5
     gy[..., 1:-1, :] = (img[..., 2:, :] - img[..., :-2, :]) * 0.5
@@ -131,7 +126,7 @@ def normal_equations(rgb: Tensor, target: Tensor, depth: Tensor, mask: Tensor, c
 
 
 def _gaussian_blur(x: Tensor, sigma: float) -> Tensor:
-    """Separable Gaussian blur of (B, V, C, H, W). Widens a coarse level's basin."""
+    """Separable Gaussian blur of (B, V, C, H, W)."""
     ks = int(2 * round(3 * sigma) + 1)
     key = (ks, sigma, x.device, x.dtype)
     if key not in _blur_kernels:
@@ -145,7 +140,7 @@ def _gaussian_blur(x: Tensor, sigma: float) -> Tensor:
 
 
 def _downscale(camera: Camera, target: Tensor, scale: float):
-    """One pyramid level: the camera scaled and the target resized to `scale` of full res."""
+    """Camera and target of one pyramid level at `scale` of full resolution."""
     if scale == 1.0:
         return camera, target
     cam = camera.scale(torch.tensor([scale, scale], device=camera.device))
@@ -160,14 +155,15 @@ class PoseAligner:
     """Coarse-to-fine analytic Levenberg-Marquardt pose alignment, per view.
 
     Args:
-        levels: Coarse -> fine pyramid; each level is (render_scale, n_steps, blur_sigma).
-        verify: Verify every step against the next render (LM accept/reject, trust-region
-            adaptation). False applies each solve at fixed damping, one render per step.
-        abs_tol, rel_tol: An accepted step must improve the cost by more than
-            max(abs_tol, rel_tol * cost) (only with verify).
-        max_step: Per-step trust-region clamp on the twist norm.
-        coarse_tile_size, fine_tile_size: gsplat tile_size below / from half resolution.
-        coarse_radius_clip: Cull sub-pixel splats below half resolution.
+        levels: Pyramid levels, coarse to fine, each (render scale, steps, blur sigma).
+        verify: Accept or reject every step against the next render.
+        abs_tol: With `verify`, a level converges once an accepted step lowers the cost by
+            less than max(abs_tol, rel_tol * cost).
+        rel_tol: Relative part of that tolerance.
+        max_step: Trust-region radius on the pose twist.
+        coarse_tile_size: gsplat tile_size below scale 0.5.
+        fine_tile_size: gsplat tile_size from scale 0.5.
+        coarse_radius_clip: Cull sub-pixel splats below scale 0.5.
     """
 
     def __init__(
@@ -187,7 +183,7 @@ class PoseAligner:
         self.coarse_radius_clip = coarse_radius_clip
 
     def _render_kw(self, scale: float, bg: Optional[Tensor]) -> Dict[str, Any]:
-        """Rasterizer arguments of a level: small tiles and sub-pixel culling when coarse."""
+        """Rasterizer arguments of a level."""
         kw = {"tile_size": self.coarse_tile_size if scale < 0.5 else self.fine_tile_size}
         if scale < 0.5:
             kw["radius_clip"] = self.coarse_radius_clip
@@ -204,8 +200,18 @@ class PoseAligner:
         image: Tensor,
         background: Optional[Tensor] = None,
     ) -> Pose:
-        """Align the c2w poses (B, V) of `camera` so the render of `gaussians` (B, N) matches
-        `image` (B, V, 3, H, W). Returns the refined poses, detached."""
+        """Align c2w poses (B, V) so the render of `gaussians` (B, N) matches `image`.
+
+        Args:
+            gaussians: Gaussians (B, N).
+            camera: Cameras (B, V).
+            pose: Initial c2w poses (B, V).
+            image: Target images (B, V, 3, H, W).
+            background: Optional background colors of the renders.
+
+        Returns:
+            The refined c2w poses (B, V), detached.
+        """
         gaussians = gaussians.detach()
         b, v = camera.shape[:2]
         dev = pose.device
@@ -214,7 +220,7 @@ class PoseAligner:
             if sigma > 0:
                 target_s = _gaussian_blur(target_s, sigma)
             render_kw = self._render_kw(scale, background)
-            # the twist being tried (rot, trans) and the last accepted one, relative to `pose`
+            # tried and accepted twists (rot, trans), relative to `pose`
             rot, trans = torch.zeros(b, v, 3, device=dev), torch.zeros(b, v, 3, device=dev)
             acc_rot, acc_trans = rot, trans
             lam = torch.full((b, v), _DAMPING, device=dev)
@@ -229,8 +235,8 @@ class PoseAligner:
                 r, H, g = normal_equations(rgb, target_s, depth, mask, cam_s)
                 cost = (r**2).mean(dim=(-3, -2, -1))  # (B, V)
 
-                # Trust-region LM per view: a step that raises the cost is rolled back, the
-                # region halved and the damping grown.
+                # per view: a step that raises the cost is rolled back and retried with a
+                # smaller radius and more damping
                 if acc_cost is None or not self.verify:
                     better = torch.ones_like(cost, dtype=torch.bool)
                     improve = torch.full_like(cost, float("inf"))
@@ -260,9 +266,8 @@ class PoseAligner:
                 norm = step.norm(dim=-1, keepdim=True).clamp(min=1e-9)
                 step = step * (radius[..., None] / norm).clamp(max=1.0)
                 rot, trans = acc_rot + step[..., :3], acc_trans + step[..., 3:]
-            # unverified, the last solve is applied too, not just the accepted state
             if self.verify:
                 pose = pose @ Pose.from_aa(acc_rot, acc_trans)
-            else:
+            else:  # unverified: apply the last solve
                 pose = pose @ Pose.from_aa(rot, trans)
         return pose

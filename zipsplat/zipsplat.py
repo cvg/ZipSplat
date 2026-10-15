@@ -1,18 +1,18 @@
 """ZipSplat model: feed-forward 3D Gaussians, camera poses and intrinsics from unposed views.
 
-Pipeline (the training model, splatfactory/models/networks/zipsplat.py, without the losses):
-    1. A DA3 backbone with cross-view attention encodes the views into per-layer tokens
-       (local | global halves) plus a camera token per view.
-    2. Prepare: each layer's payload is the global half plus a gated LayerNorm of the local
-       half; a ColorEmbedMLP turns the RGB patches into color tokens; a TokenMerge over all
-       payloads and the color tokens gives one geometry token per patch.
-    3. Compress: k-means on the geometry tokens picks K = r * V * T clusters (skipped at
-       r = 1); the scene tokens start as the per-cluster member means.
-    4. Fuse: per layer, deepest first, a cross-attention (q = scene tokens, k = geometry tokens,
-       v = that layer's payload) and a self-attention; a 4th cross-attention reads the color
-       tokens.
-    5. Decode: the GaussianHead turns each scene token into a group of Gaussians with free 3D
-       offsets; the camera head reads pose and intrinsics off the deepest camera token.
+The training model (splatfactory/models/networks/zipsplat.py) without the losses:
+    1. Encode. A DA3 backbone with cross-view attention turns the views into per-layer tokens
+       (local and global halves) plus a camera token per view.
+    2. Prepare. Each layer's payload is the global half plus a gated LayerNorm of the local
+       half. A ColorEmbedMLP turns the RGB patches into color tokens, and a TokenMerge over
+       all payloads and the color tokens gives one geometry token per patch.
+    3. Compress. k-means on the geometry tokens picks K = r * V * T clusters, skipped at
+       r = 1. The scene tokens start as the cluster means.
+    4. Fuse. Per layer, deepest first, a cross-attention (queries: scene tokens, keys:
+       geometry tokens, values: the layer's payload) and a self-attention. A fourth
+       cross-attention reads the color tokens.
+    5. Decode. The GaussianHead turns each scene token into a group of Gaussians with free 3D
+       offsets, the camera head reads pose and intrinsics off the deepest camera token.
 
 Author: Alexander Veicht
 """
@@ -70,15 +70,18 @@ class ZipSplat(nn.Module):
     def encode(
         self, images: Tensor, cameras: Optional[Camera] = None, poses: Optional[Pose] = None
     ) -> Dict[str, Tensor]:
-        """Backbone + prepare: everything that does not depend on the compression.
+        """Encode and prepare, everything that does not depend on the compression.
 
         Args:
-            images: (B, V, 3, H, W) in [0, 1].
-            cameras, poses: Optional (B, V) priors injected into the backbone (c2w poses).
+            images: Input images (B, V, 3, H, W) in [0, 1].
+            cameras: Optional camera priors (B, V) for the backbone.
+            poses: Optional c2w pose priors (B, V) for the backbone.
 
         Returns:
-            Dict with layer_tokens (list of (B, V, T, D), shallow to deep), geo_tokens and
-            color_tokens (B, V, T, D), and cam_token (B, V, 2 * D) of the deepest layer.
+            layer_tokens: Per-layer payloads (B, V, T, D), shallow to deep.
+            geo_tokens: Geometry tokens (B, V, T, D).
+            color_tokens: Color tokens (B, V, T, D).
+            cam_token: Camera tokens (B, V, 2 * D) of the deepest layer.
         """
         x = (images - self._img_mean) / self._img_std
         tokens = self.backbone(x, pose=poses, camera=cameras)  # (patch, camera) per layer
@@ -97,9 +100,9 @@ class ZipSplat(nn.Module):
         }
 
     def cluster(self, geo_tokens: Tensor, images: Tensor, compression: float) -> Tuple[Tensor, ...]:
-        """k-means on the geometry tokens: (nearest_idx (B, K), assignments (B, V * T)).
+        """Token nearest to each cluster (B, K) and cluster per token (B, V * T) of a k-means.
 
-        Both are arange(V * T) when the compression keeps every token (k-means skipped).
+        Both are arange(V * T) when the compression keeps every token.
         """
         B, V, T, _ = geo_tokens.shape
         if compression >= 1.0:
@@ -113,10 +116,10 @@ class ZipSplat(nn.Module):
             )
 
     def fuse(self, enc: Dict[str, Tensor], scene_tokens: Tensor) -> Tensor:
-        """Refine the (B, K, D) scene tokens by attending into the encoded views."""
+        """Refine the scene tokens (B, K, D) by attending into the encoded views."""
         flat = lambda t: rearrange(t, "B V T D -> B (V T) D")  # noqa: E731
         geo = flat(enc["geo_tokens"])
-        # Deepest layer first: coarse scene layout before fine detail.
+        # deepest layer first: coarse scene layout before fine detail
         for l in reversed(range(self.num_layers)):
             scene_tokens = self.cross_attention[l](scene_tokens, geo, flat(enc["layer_tokens"][l]))
             scene_tokens = self.self_attention[l](scene_tokens)
@@ -130,8 +133,7 @@ class ZipSplat(nn.Module):
         geo = rearrange(enc["geo_tokens"], "B V T D -> B (V T) D")
         scene_tokens = cluster_mean(tokens=geo, assignments=assignments, K=nearest_idx.shape[1])
         scene_tokens = self.fuse(enc, scene_tokens)
-        # fp32 heads regardless of the caller's autocast: bf16 rounding shows up directly in
-        # the Gaussian positions and the pose error.
+        # fp32 heads under any autocast, bf16 rounding shows in the positions and the poses
         with torch.autocast(images.device.type, enabled=False):
             gaussians = self.gaussian_head(scene_tokens.float())
             pose_enc = self.backbone.cam_dec(enc["cam_token"].float())
@@ -157,17 +159,18 @@ class ZipSplat(nn.Module):
         """Predict Gaussians and the input cameras from multi-view images.
 
         Args:
-            images: (B, V, 3, H, W) in [0, 1], H and W divisible by the patch size.
-            cameras, poses: Optional (B, V) priors injected into the backbone (c2w poses).
-            compression: Fraction of the V * T tokens kept as scene tokens, in (0, 1]; 1.0
+            images: Input images (B, V, 3, H, W) in [0, 1], sides divisible by the patch size.
+            cameras: Optional camera priors (B, V) for the backbone.
+            poses: Optional c2w pose priors (B, V) for the backbone.
+            compression: Fraction of the V * T tokens kept as scene tokens, in (0, 1]. 1.0
                 skips k-means.
 
         Returns:
             gaussians: Gaussians (B, K * G).
-            poses: Predicted c2w poses (B, V) of the input views (first view ~ identity).
+            poses: Predicted c2w poses (B, V), the first view near identity.
             cameras: Predicted cameras (B, V) at the input resolution.
             scene_tokens: Scene tokens (B, K, D), the GaussianHead input.
-            nearest_idx: (B, K) token nearest to each cluster.
-            assignments: (B, V * T) cluster of each token.
+            nearest_idx: Token nearest to each cluster (B, K).
+            assignments: Cluster per token (B, V * T).
         """
         return self.decode(self.encode(images, cameras, poses), images, compression)

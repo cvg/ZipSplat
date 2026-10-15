@@ -24,10 +24,7 @@ from zipsplat.pose import Pose
 def scene_center_radius(
     gaussians: Gaussians, quantile: float = 0.9, margin: float = 1.2
 ) -> Tuple[torch.Tensor, float]:
-    """Scene center and radius from the Gaussian positions alone (no poses needed).
-
-    center = median(means); radius = quantile(||means - center||) * margin.
-    """
+    """Scene centre (median of the means) and radius (`quantile` distance times `margin`)."""
     means = gaussians.means.detach()
     center = means.median(dim=0).values
     radius = float((means - center).norm(dim=-1).quantile(quantile) * margin)
@@ -45,20 +42,20 @@ def orbit_poses(
     azimuth_amp_deg: float = 16.0,
     elevation_amp_deg: float = 4.0,
 ) -> Pose:
-    """Orbit trajectory around `center` at `radius` (up = (0, -1, 0), OpenCV y-down frame).
+    """Orbit poses around `center`, up = (0, -1, 0) in the OpenCV frame.
 
-    azimuth/elevation 0 places the camera on the canonical front (-z side, looking toward +z),
-    matching the reference-view orientation of the prediction frame.
+    Azimuth and elevation 0 put the camera in front of the scene, like the first input view.
 
     Args:
-        center: orbit pivot, shape (3,).
-        radius: distance from the pivot.
-        num_frames: number of poses along the path.
-        sweep_deg: if set, sweep this many degrees of azimuth (e.g. 360 = full turntable).
-            If ``None``, use an amplitude-limited wiggle instead (better for sparse,
-            front-facing scenes where a full revolution would expose empty backsides).
-        base_azimuth_deg / elevation_deg: starting azimuth and (constant) elevation.
-        azimuth_amp_deg / elevation_amp_deg: wiggle amplitudes (only used when sweep_deg is None).
+        center: Orbit pivot (3,).
+        radius: Distance from the pivot.
+        num_frames: Number of poses.
+        sweep_deg: Azimuth sweep in degrees, 360 for a full turntable. None wiggles instead,
+            which suits front-facing scenes.
+        base_azimuth_deg: Starting azimuth.
+        elevation_deg: Elevation of the orbit.
+        azimuth_amp_deg: Azimuth amplitude of the wiggle.
+        elevation_amp_deg: Elevation amplitude of the wiggle.
     """
     t = torch.linspace(0.0, 1.0, num_frames)
     if sweep_deg is None:
@@ -79,11 +76,7 @@ def render_video(
     bg: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     chunk: int = 16,
 ) -> np.ndarray:
-    """Render a camera path through gsplat. Returns (T, H, W, 3) uint8 frames.
-
-    `cameras` and `poses` must share batch shape (T,). Rendering is chunked over frames to
-    bound memory; all frames are assumed to share the same image size.
-    """
+    """Uint8 frames (T, H, W, 3) along cameras and poses (T,) of one image size, in chunks."""
     device = gaussians.device
     cameras, poses = cameras.to(device), poses.to(device)
     T = poses.shape[0]
@@ -128,18 +121,19 @@ def turntable(
     bg: Tuple[float, float, float] = (1.0, 1.0, 1.0),
     chunk: int = 16,
 ) -> np.ndarray:
-    """Render and save a turntable mp4 orbiting the predicted scene; returns the frames.
+    """Render an orbit around the scene, save it as mp4 and return the frames.
 
     Args:
-        gaussians: unbatched predicted scene (shape (N,)).
-        path: output mp4 path.
-        fov_deg: horizontal field of view of the render camera, in degrees.
-        render_size: output frame size in pixels (square).
-        num_frames / fps: trajectory length and playback rate.
-        sweep_deg: azimuth sweep (360 = full turntable); None = amplitude-limited wiggle.
-        elevation_deg: constant elevation of the orbit.
-        bg: background RGB in [0, 1].
-        chunk: frames rendered per gsplat call.
+        gaussians: The scene (N,).
+        path: Output mp4 path.
+        fov_deg: Field of view of the render camera in degrees.
+        render_size: Side of the square frames in pixels.
+        num_frames: Number of frames.
+        fps: Playback rate.
+        sweep_deg: Azimuth sweep in degrees, 360 for a full turntable. None wiggles instead.
+        elevation_deg: Elevation of the orbit.
+        bg: Background color in [0, 1].
+        chunk: Frames per render call.
     """
     fov = torch.tensor(math.radians(fov_deg))
     camera = Camera.from_fov(fov, w=render_size, h=render_size).to(gaussians.device)

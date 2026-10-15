@@ -13,10 +13,10 @@ from torch import Tensor
 def photo_complexity_weights(
     images: Tensor, pH: int, pW: int, alpha: float = 2.0, eps: float = 0.05
 ) -> Tensor:
-    """Per-token seeding weights from 2D photometric complexity: (B, V, 3, H, W) -> (B, V*pH*pW).
+    """Per-token k-means seeding weights (B, V * pH * pW) of images (B, V, 3, H, W).
 
-    Squared grayscale image-gradient energy, averaged per patch, turned into a per-scene rank
-    in [0, 1] and raised to `alpha`: complex regions get more centroids.
+    The per-patch gradient energy of the grayscale image, ranked to [0, 1] per scene, shifted
+    by `eps` and raised to `alpha`. Complex regions get more centroids.
     """
     B, V, _, H, W = images.shape
     w = images.new_tensor([0.299, 0.587, 0.114])
@@ -36,19 +36,20 @@ def kmeans(
     chunk_size: int = 2048,
     init_weights: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Spherical hard k-means with chunked distances; stops at the assignment fixed point.
+    """Spherical hard k-means with chunked distances, stopped once the assignments settle.
 
     Args:
-        x: (B, N, D) features (L2-normalized internally).
+        x: Features (B, N, D), L2-normalized internally.
         K: Number of clusters.
         n_iters: Iteration cap.
         chunk_size: Tokens per chunk of the distance computation.
-        init_weights: (B, N) seeding weights: the K seeds are sampled without replacement in
-            proportion to them. None seeds uniformly over the token order.
+        init_weights: Seeding weights (B, N), the K seeds are sampled in proportion to them.
+            Default: uniform over the token order.
 
     Returns:
-        centroids (B, K, D) unit-norm, nearest_idx (B, K) the token nearest to each centroid,
-        assignments (B, N) the cluster of each token.
+        centroids: Unit-norm cluster centroids (B, K, D).
+        nearest_idx: Index of the token nearest to each centroid (B, K).
+        assignments: Cluster id per token (B, N).
     """
     B, N, D = x.shape
     x = F.normalize(x, dim=-1)
@@ -66,7 +67,7 @@ def kmeans(
             assignments[:, s : s + chunk_size] = torch.cdist(
                 x[:, s : s + chunk_size], centroids
             ).argmin(dim=-1)
-        # Converged: the centroids already are the means of exactly these assignments.
+        # converged: the centroids are already the means of these assignments
         if prev is not None and bool((assignments == prev).all()):
             break
         prev = assignments
@@ -91,13 +92,14 @@ def complexity_kmeans(
     """ZipSplat's token clustering: spherical k-means seeded by photometric complexity.
 
     Args:
-        tokens: (B, N, D) geometry tokens, N = V * pH * pW.
+        tokens: Geometry tokens (B, N, D), N = V * pH * pW.
         K: Number of clusters.
-        images: (B, V, 3, H, W) context images in [0, 1].
+        images: Input images (B, V, 3, H, W) in [0, 1], whose complexity seeds the centroids.
         patch_size: Patch size in pixels.
 
     Returns:
-        nearest_idx (B, K) and assignments (B, N).
+        nearest_idx: Index of the token nearest to each centroid (B, K).
+        assignments: Cluster id per token (B, N).
     """
     pH, pW = images.shape[-2] // patch_size, images.shape[-1] // patch_size
     weights = photo_complexity_weights(images, pH, pW)
@@ -106,7 +108,7 @@ def complexity_kmeans(
 
 
 def cluster_mean(tokens: Tensor, assignments: Tensor, K: int) -> Tensor:
-    """Per-cluster member mean (B, K, D) of (B, N, D) tokens (identity when K == N)."""
+    """Per-cluster mean (B, K, D) of tokens (B, N, D), the identity when K == N."""
     B, N, D = tokens.shape
     if K == N:
         return tokens

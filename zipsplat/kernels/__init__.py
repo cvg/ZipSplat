@@ -1,12 +1,7 @@
-"""Fused Triton kernels for TokenBA's solvers.
+"""Fused Triton kernels of TokenBA's solvers, each with a pure-torch fallback.
 
-A kernel is tensor-in/tensor-out and ships its own pure-torch fallback, so importing this
-package never requires Triton:
-
-  * ``normal_equations`` -- JtJ / Jtr reduction of the photometric pose aligner
-    (``pose_aligner.normal_equations``); ``analytic_normal_eq`` is None without Triton.
-  * ``pnp`` -- whole-solver GNC-IRLS-LM PnP for TokenBA's camera update
-    (``zipsplat.pnp.robust_pnp``); ``pnp_gnc`` picks the Triton or torch solver.
+    normal_equations  JtJ and Jtr of the photometric aligner, None without Triton.
+    pnp               The robust PnP solve of TokenBA's camera update.
 """
 
 from zipsplat.kernels.normal_equations import analytic_normal_eq

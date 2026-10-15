@@ -181,7 +181,7 @@ class Pose(TensorWrapper):
         return p3d @ self.R.transpose(-1, -2) + self.t.unsqueeze(-2)
 
     def __matmul__(self, other: Union["Pose", torch.Tensor]) -> Union["Pose", torch.Tensor]:
-        """`pose @ other_pose` -> compose; `pose @ p3d` -> transform points."""
+        """Compose with another pose (`pose @ other`) or transform points (`pose @ p3d`)."""
         if isinstance(other, self.__class__):
             return self.compose(other)
         return self.transform(other)

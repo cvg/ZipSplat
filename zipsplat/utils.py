@@ -14,11 +14,10 @@ from PIL import Image
 
 
 class TensorWrapper:
-    """Single-tensor wrapper. Subclasses pack their parameters into a ``[..., D]`` tensor and
-    expose named views over the trailing dimension; all leading dimensions are batch dims.
+    """Single-tensor wrapper: subclasses pack their parameters into a (..., D) tensor.
 
-    The leading ``data_.shape[:-1]`` is the batch shape (``self.shape``). Indexing, dtype/device
-    moves, and ``torch.cat`` / ``torch.stack`` operate on the batch dims and rewrap the result.
+    The leading dims are the batch shape (`self.shape`). Indexing, dtype and device moves, and
+    `torch.cat` / `torch.stack` act on them and rewrap the result.
     """
 
     data_: torch.Tensor
@@ -186,11 +185,7 @@ def resize_image(image: torch.Tensor, h: int, w: int) -> torch.Tensor:
 
 
 def crop_to_ar(image: torch.Tensor, ar: float) -> torch.Tensor:
-    """Center-crop image (..., 3, H, W) to aspect ratio `ar` (= w/h).
-
-    ar > 1 = landscape, ar < 1 = portrait, ar = 1 = square.
-    Whichever dimension exceeds the target is cropped; never resizes.
-    """
+    """Centre-crop an image (..., 3, H, W) to the aspect ratio `ar` = w / h, without resizing."""
     H, W = image.shape[-2:]
     target_w = round(H * ar)
     if target_w <= W:

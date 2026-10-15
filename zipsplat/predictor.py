@@ -147,7 +147,7 @@ class ZipSplat(nn.Module):
         """Predict Gaussians and the input cameras from the views of one scene.
 
         Args:
-            images: list of (3, h, w) views (any sizes) or a (V, 3, h, w) tensor in [0, 1].
+            images: List of views (3, h, w) of any size, or a tensor (V, 3, h, w), in [0, 1].
             compression: Fraction of the tokens kept as scene tokens, in (0, 1]. 1.0 skips
                 k-means.
             ba: Refine the prediction with test-time bundle adjustment on the input views
@@ -157,8 +157,11 @@ class ZipSplat(nn.Module):
             gaussians: Gaussians (N,), in the frame of the first input view.
             poses: c2w poses (V,) of the input views.
             cameras: Cameras (V,) of the original input images.
-            scene_tokens, nearest_idx, assignments: The (K, D) scene tokens and the clustering.
-            model_images, model_cameras: The (V, 3, H, W) model inputs and their cameras.
+            scene_tokens: Scene tokens (K, D).
+            nearest_idx: Token nearest to each cluster (K,).
+            assignments: Cluster per token (V * T,).
+            model_images: The model inputs (V, 3, H, W).
+            model_cameras: Cameras (V,) of the model inputs.
         """
         sizes = [(im.shape[-1], im.shape[-2]) for im in images]
         model_images, offset, scale = self.prepare_inputs(images)

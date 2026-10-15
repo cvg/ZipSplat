@@ -135,7 +135,7 @@ except ImportError:
 
 
 class SwiGLUFFNFused(_SwiGLU):
-    """SwiGLU with hidden dim rounded to a multiple of 8; uses xformers when available."""
+    """SwiGLU with the hidden dim rounded to a multiple of 8, on xformers when available."""
 
     def __init__(
         self,

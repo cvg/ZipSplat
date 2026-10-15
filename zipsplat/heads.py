@@ -43,11 +43,10 @@ class GaussianHead(nn.Module):
         )
 
     def decode(self, tokens: Tensor, half_mlp: bool = False) -> Tuple[Tensor, ...]:
-        """(B, K, D) tokens -> activated (means, scales, quats, opacities, sh_coeffs) of the
-        B x (K * G) Gaussians.
+        """Activated (means, scales, quats, opacities, sh_coeffs) of tokens (B, K, D).
 
-        half_mlp runs the MLP body in fp16 (TokenBA); the readout and the activations always
-        stay fp32 (the positions would quantize).
+        The Gaussians have batch shape (B, K * G). `half_mlp` runs the MLP body in fp16, the
+        readout and the activations stay fp32 so the positions do not quantize.
         """
         if half_mlp:
             with torch.autocast("cuda", dtype=torch.float16):

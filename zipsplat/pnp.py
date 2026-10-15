@@ -1,15 +1,13 @@
-"""Robust PnP of camera poses on ZipSplat's patch-Gaussian correspondences (TokenBA's camera
-update).
+"""Robust PnP of the input poses on ZipSplat's patch-Gaussian correspondences.
 
-Training ties each token's Gaussians to the patch it was read from, so every Gaussian is a free
-2D-3D correspondence (3D mean vs source patch centre) and each pose is a PnP problem: render-free,
-solved by GNC-IRLS (kernels.pnp) from several rotation hypotheses.
+Training ties each token's Gaussians to the patch it was read from, so every Gaussian gives a
+2D-3D correspondence and each pose is a render-free PnP problem.
 
 Author: Alexander Veicht
 """
 
 import math
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
@@ -20,7 +18,7 @@ from zipsplat.kernels import pnp_gnc
 from zipsplat.pose import Pose
 
 _Z_EPS = 1e-4
-_INLIER_PX = 28.0  # 2 patch units: what counts as a hit when ranking multi-start hypotheses
+_INLIER_PX = 28.0  # inlier radius of the hypothesis ranking, two patches
 
 
 def patch_correspondences(
@@ -30,23 +28,24 @@ def patch_correspondences(
     assignments: Optional[Tensor] = None,
     gaussians_per_token: int = 32,
     patch_px: int = 14,
-):
-    """Rebuild the Gaussian -> source patch correspondences from a flattened prediction.
+) -> Tuple[Tensor, Tensor]:
+    """Gaussian to source-patch correspondences of a prediction.
 
-    Without compression the Gaussians are token-major; under compression each token
-    contributes its cluster's Gaussians, observed at its own patch centre.
+    Under compression each token contributes its cluster's Gaussians, observed at its own patch
+    centre.
 
     Args:
-        gaussians: Batched Gaussians (1, N).
-        image_hw: (H, W) of the patch grid's image.
+        gaussians: Gaussians (1, N).
+        image_hw: Size (H, W) of the image the patch grid covers.
         num_views: Number of input views V.
-        assignments: Per-token cluster ids (V * T) of a compressed prediction, or None.
-        gaussians_per_token: Gaussians per token (only used with assignments).
+        assignments: Per-token cluster ids (V * T) of a compressed prediction. Default: the
+            token-major order of a full-quality one.
+        gaussians_per_token: Gaussians per token G, used with `assignments`.
         patch_px: Patch size in pixels.
 
     Returns:
-        pts (V, M, 3) world-frame Gaussian means and obs (M, 2) the patch centre (x, y) each
-        should project to, M = T * G for T patches per view (obs is shared across views).
+        pts: World-frame Gaussian means (V, M, 3), M = T * G for T patches per view.
+        obs: Patch centre (x, y) each mean should project to (M, 2), shared across views.
     """
     H, W = image_hw
     pH, pW = H // patch_px, W // patch_px
@@ -77,18 +76,19 @@ def robust_pnp(
 ) -> Pose:
     """Robust multi-start PnP of the input poses on the patch correspondences.
 
-    7 rotation hypotheses per view (identity plus +-`hypotheses_deg` about each camera axis)
-    are solved in ONE batched call; the hypothesis with the most inliers wins.
+    Seven rotation hypotheses per view (the init and +-`hypotheses_deg` about each camera axis)
+    are solved in one batched call, and the hypothesis with the most inliers wins.
 
     Args:
         pose: Initial c2w poses (1, V).
-        camera: Cameras (1, V) of the patch grid.
-        pts, obs: Correspondences from `patch_correspondences`.
-        scales: GNC robust-scale ladder in pixels, coarse -> fine.
+        camera: Cameras of the patch grid (1, V).
+        pts: World-frame points (V, M, 3) from `patch_correspondences`.
+        obs: Their image observations (M, 2).
+        scales: Robust-scale ladder in pixels, coarse to fine.
         iters: IRLS iterations per scale.
-        subsample: Correspondences per solve (fixed seed), None for all.
+        subsample: Correspondences per solve, None for all.
         hypotheses_deg: Rotation offset of the extra hypotheses.
-        backend: kernels.pnp_gnc backend ("auto", "triton" or "torch").
+        backend: Solver backend, "auto", "triton" or "torch".
 
     Returns:
         The refined c2w poses (1, V).
@@ -127,7 +127,7 @@ def robust_pnp(
         backend=backend,
     )
 
-    # rank hypotheses on ALL correspondences, not just the subsampled solve set
+    # rank the hypotheses on all correspondences
     P = pts_k @ R.transpose(-1, -2) + t[:, None]
     Z = P[..., 2].clamp(min=_Z_EPS)
     uv = P[..., :2] / Z[..., None] * cam_k.f[0][:, None] + cam_k.c[0][:, None]
