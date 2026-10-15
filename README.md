@@ -162,13 +162,14 @@ refined = model.refine(pred, joint_steps=32, verbose=True)
 
 ## Models
 
-| `weights=`     | Backbone  | Input                          | Training data                                                                                            |
-| -------------- | --------- | ------------------------------ | -------------------------------------------------------------------------------------------------------- |
-| `zipsplat`     | DA3-Giant | long edge 504, 7 aspect ratios | RE10K, DL3DV, ScanNet++, ARKitScenes, Hypersim, UnrealStereo4K, BlendedMVS, CO3D, WildRGB-D, G-Objaverse |
-| `zipsplat-252` | DA3-Giant | 252 x 252                      | RE10K, DL3DV                                                                                             |
+| `weights=`     | Backbone  | Input                          | Gaussians / token | Training data                                                                                            |
+| -------------- | --------- | ------------------------------ | ----------------- | -------------------------------------------------------------------------------------------------------- |
+| `zipsplat`     | DA3-Giant | long edge 504, 7 aspect ratios | 16                | RE10K, DL3DV, ScanNet++, ARKitScenes, Hypersim, UnrealStereo4K, BlendedMVS, CO3D, WildRGB-D, G-Objaverse |
+| `zipsplat-252` | DA3-Giant | 252 x 252                      | 32                | RE10K, DL3DV                                                                                             |
 
-`zipsplat` is the default and the model to use in the wild. The paper's numbers are from
-`zipsplat-252`. The weights are hosted on the [Hugging Face Hub](https://huggingface.co/veichta/zipsplat)
+`zipsplat` is the default and the model to use in the wild. It decodes 16 Gaussians per token
+instead of the paper's 32 to keep the Gaussian count reasonable at the higher resolution. The
+paper's numbers are from `zipsplat-252`. The weights are hosted on the [Hugging Face Hub](https://huggingface.co/veichta/zipsplat)
 and fetched on first use. You can also pass a local path or URL: `ZipSplat(weights="path/to/checkpoint.tar")`.
 
 ## Training and evaluation
