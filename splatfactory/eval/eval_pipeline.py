@@ -34,6 +34,11 @@ def load_eval(dir):
 def save_eval(dir, summaries, figures, results):
     with h5py.File(str(dir / "results.h5"), "w") as hfile:
         for k, v in results.items():
+            if len({np.shape(x) for x in v}) > 1:  # ragged (e.g. per-pair pose errors)
+                dset = hfile.create_dataset(k, (len(v),), dtype=h5py.vlen_dtype(np.float64))
+                for i, x in enumerate(v):
+                    dset[i] = np.asarray(x, dtype=np.float64).ravel()
+                continue
             arr = np.array(v)
             if not np.issubdtype(arr.dtype, np.number):
                 arr = arr.astype("object")
@@ -61,6 +66,7 @@ def exists_eval(dir):
 class EvalPipeline:
     default_conf = {
         "max_samples": None,  # Number of samples to run eval on (None=all)
+        "delete_predictions": False,  # Delete predictions.h5 after eval (results.h5 stays)
     }
     eval_data_conf = {}
 
@@ -125,6 +131,9 @@ class EvalPipeline:
             save_eval(experiment_dir, s, f, r)
             logger.info(f"Loop 2 finished. Results saved to {experiment_dir}.")
         s, r = load_eval(experiment_dir)
+        if self.conf.delete_predictions:
+            pred_file.unlink(missing_ok=True)
+            logger.info(f"Deleted predictions file {pred_file}.")
         return s, f, r
 
     def save_conf(self, experiment_dir, overwrite=False, overwrite_eval=False):

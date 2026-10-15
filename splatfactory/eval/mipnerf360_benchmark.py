@@ -10,7 +10,8 @@ from splatfactory.eval.multiview_benchmark import MultiViewBenchmark
 
 
 class MipNeRF360Benchmark(MultiViewBenchmark):
-    # context view count -> shipped eval index (select with `--views`)
+    # context view count -> eval index (select with `eval.num_views`). FPS context views, 8
+    # targets per scene.
     INDICES = {
         32: "splatfactory/eval/indices/mipnerf360/ctx_32v.json",
         64: "splatfactory/eval/indices/mipnerf360/ctx_64v.json",
@@ -20,8 +21,6 @@ class MipNeRF360Benchmark(MultiViewBenchmark):
         "data": {
             "name": "dataset_mipnerf360",
             "view_sampler": {"name": "eval_sampler", "indices_file": INDICES[32]},
-            "num_workers": 2,
-            "prefetch_factor": None,
         },
     }
 

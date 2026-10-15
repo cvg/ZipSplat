@@ -8,6 +8,6 @@ dl3dv_benchmark:
   delete_predictions: true
   data:
     view_sampler:
-      indices_file: splatfactory/eval/indices/dl3dv/ctx_24v_tgt_8v.json
+      indices_file: splatfactory/eval/indices/dl3dv/longlrm_ctx_16v.json
   eval:
     align_poses: true

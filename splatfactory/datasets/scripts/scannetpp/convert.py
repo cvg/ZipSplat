@@ -7,7 +7,7 @@ Per device:
   - DSLR: `resized_images/*.JPG` (OPENCV_FISHEYE) undistorted to PINHOLE in memory, exactly
     as the ScanNet++ toolkit does, plus the mesh depth at the new K.
   - iPhone: every registered frame of `rgb.mkv`, undistorted in memory (OPENCV to PINHOLE),
-    plus the mesh depth. The iPhone captures have no NVS test split and only add training data.
+    plus the mesh depth. Its test split (the NVS validation rooms) is the ScanNet++ benchmark.
 
 Conventions:
   - `cameras` = Camera.data_ = [w, h, fx, fy, cx, cy] from the transforms.

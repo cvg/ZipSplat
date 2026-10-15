@@ -9,6 +9,7 @@ model:
   name: networks.zipsplat_eval  # ZipSplat + TokenBA, model.token_ba=null skips the BA
   weights: https://huggingface.co/veichta/zipsplat/resolve/main/zipsplat-da3g-252.tar
   return_attention: false
+  amp: null  # fp32 inference, bfloat16 runs the forward under bf16 autocast
   use_priors: false  # true injects the GT context cameras into the backbone
   backbone:
     weights: null  # the released checkpoint holds the backbone
