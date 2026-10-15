@@ -1,3 +1,4 @@
+# 50/50 RE10K + DL3DV at 252 px, the mix of the paper model.
 name: composed
 seed: 0
 
@@ -7,7 +8,7 @@ num_workers: 8
 prefetch_factor: 2
 
 image_num_range: [2, 24]
-aspect_ratio_range: [1.0, 1.0]
+aspect_ratios: [1.0]
 num_target_views: 4
 random_reference_view: true
 use_relative_poses: true

@@ -1,12 +1,14 @@
-# DA3-Giant training
+# ZipSplat training on DA3-Giant (the zipsplat-252 release): model/zipsplat.yaml on
+# 50/50 RE10K + DL3DV at 252 px.
 defaults:
   - model: zipsplat
-  - data: composed_252
-  - train: zipsplat
+  - data: re10k_dl3dv_252
   - benchmarks: re10k_dl3dv
   - _self_
 
 data:
+  # Global batch for the 4-node run: 24/GPU x 4 GPUs x 4 nodes. Scale it down for
+  # fewer nodes (single-node debug: data.batch_size=96).
   batch_size: 384
   image_num_range: [2, 24]
   view_schedule: 0.5
@@ -17,5 +19,51 @@ data:
 
 train:
   seed: 1
-  num_steps: 450_000
+  matmul_precision: high
+  mixed_precision: bfloat16
+  compile: default
+
   lr: 3e-4
+  clip_grad: 1.0
+  optimizer: AdamW
+  optimizer_options:
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+    fused: true
+  lr_scaling:  # substring patterns, the first match wins
+    # DA3's camera decoder lives in the backbone: its output layers keep the full lr (its MLP
+    # trunk, cam_dec.backbone, has always matched `backbone`)
+    "cam_dec.fc": 1.0
+    backbone: 0.1  # DA3 backbone
+  num_steps: 450_000
+  warmup_steps: ${eval:'int(${train.num_steps} * 0.05)'}
+  lr_schedule:
+    type: SequentialLR
+    on_epoch: false
+    options:
+      milestones:
+        - ${train.warmup_steps}
+      schedulers:
+        - type: LinearLR
+          options:
+            total_iters: ${train.warmup_steps}
+            start_factor: ${eval:'1/${.total_iters}'}
+            end_factor: 1.0
+        - type: CosineAnnealingLR
+          options:
+            T_max: ${eval:'${train.num_steps} - ${train.warmup_steps}'}
+            eta_min: 0.0
+  ddp_find_unused_parameters: false  # cam_enc frozen, no unused trainable params
+
+  # Eval/benchmark cadence is per epoch: at batch 384 an epoch is ~680 steps, so 40 epochs
+  # ~= 27K steps (~16 evals over the run).
+  eval_every_epoch: 40
+  benchmark_every_epoch: 40
+  run_benchmarks: [dl3dv_benchmark, re10k_benchmark]
+  best_key: loss/total
+  writer: null  # tensorboard and / or wandb
+  log_every_iter: 100
+  plot_every_iter: 10_000
+  average_metrics: [mse, psnr, ssim, lpips]
+  median_metrics: []
+  stdout_metrics: [loss/total, lpips, psnr, activated_pct]
