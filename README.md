@@ -13,11 +13,13 @@
 </p>
 
 <h3 align="center">
-  <a href="https://arxiv.org/abs/2606.05102">📄 Paper</a>
+  <a href="https://arxiv.org/abs/2606.05102">📄&nbsp;Paper</a>
   &nbsp;|&nbsp;
-  <a href="https://veichta.com/zipsplat">🌐 Project Page</a>
+  <a href="https://veichta.com/zipsplat">🌐&nbsp;Project&nbsp;Page</a>
   &nbsp;|&nbsp;
-  <a href="https://huggingface.co/veichta/zipsplat">🤗 Weights</a>
+  <a href="https://huggingface.co/veichta/zipsplat">🤗&nbsp;Weights</a>
+  &nbsp;|&nbsp;
+  <a href="https://huggingface.co/spaces/veichta/ZipSplat">✨&nbsp;Demo</a>
 </h3>
 
 <p align="center">

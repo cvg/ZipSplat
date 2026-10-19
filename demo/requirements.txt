@@ -1,0 +1,14 @@
+# Hugging Face Space requirements for the ZipSplat demo (ZeroGPU: Python 3.12, torch 2.8).
+torch==2.8.0
+# gsplat compiles its CUDA kernels on first import and the Space has no nvcc: a wheel built for
+# Python 3.12, torch 2.8 and CUDA 12.8 with sm_89 and sm_120 kernels, see README.md.
+https://huggingface.co/veichta/zipsplat/resolve/main/wheels/gsplat-1.5.3-cp312-cp312-linux_x86_64.whl
+zipsplat @ git+https://github.com/cvg/ZipSplat.git
+spaces
+# gradio 4.44.1 predates huggingface_hub 1.0 (HfFolder) and starlette 1.0 (TemplateResponse)
+huggingface_hub<1.0
+starlette<1.0
+fastapi<0.130
+scipy
+opencv-python-headless
+imageio[ffmpeg]

@@ -1,0 +1,80 @@
+<!doctype html>
+<!-- Splat viewer of the demo (Spark on three.js). app.py fills in __CONFIG__ and shows the page
+in an iframe. The scene is in OpenCV coordinates and is turned into three.js ones on load. -->
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Quicksand:wght@500;600&display=swap">
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    font-family: "Quicksand", -apple-system, "Helvetica Neue", Arial, sans-serif; font-weight: 500;
+  }
+  canvas { display: block; touch-action: none; }
+  #status {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #76776c; font-size: 15px; pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+    "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="status">Loading the scene...</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const cfg = __CONFIG__;
+const status = document.getElementById("status");
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(cfg.bg);
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.add(new SparkRenderer({ renderer }));
+
+// The view starts at the first input camera and orbits a point on its optical axis.
+const camera = new THREE.PerspectiveCamera(cfg.fov, 1, cfg.near, cfg.far);
+camera.up.fromArray(cfg.up);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+new THREE.Matrix4().fromArray(cfg.pose).decompose(camera.position, camera.quaternion, camera.scale);
+controls.target.fromArray(cfg.target);
+controls.update();
+
+// The page sits in an iframe without a URL of its own, so the scene URL is made absolute here.
+const splat = new SplatMesh({ url: new URL(cfg.url, document.baseURI).href });
+splat.quaternion.set(1, 0, 0, 0);  // OpenCV (y down, z forward) -> three.js (y up, z back)
+scene.add(splat);
+splat.initialized.then(
+  () => status.remove(),
+  (err) => { status.textContent = `Could not load the scene: ${err}`; },
+);
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+resize();
+
+renderer.setAnimationLoop(() => {
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
